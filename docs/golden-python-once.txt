@@ -1,0 +1,50 @@
+# golden docker-top (Python) --once — normalizado
+# gerado: 2026-10-22T01:13:18Z
+# cmd: docker-top --once
+# exit=0
+# mascaras: HH:MM:SS-><CLOCK>, %cpu-><CPU>, pids-><PIDS>, ids->prefixo12, bytes preservados p/ schema
+# edges: sem limite => '(H)'; contexto down => linha 'Erro de Coleta' sem crash (exit 0)
+
+╭───────────────────── Docker Top Consolidador - <CLOCK> ─────────────────────╮
+│ Ctx: all | CTNs: <N>T 127A 32F | CPU: <CPU>/1200% | Mem: 17.56 GiB/83.89    │
+│ GiB                                                                          │
+│ Net: ↓112.42 GiB ↑183.72 GiB | Disco: R 257.37 GiB W 115.65 GiB | Refresh:   │
+│ 2.0s ([+]/-)                                                                 │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ID      CONTEXT   NAME              C… M… CP…  MEM LIM  LIM      NET   DISC P… 
+ 9155f0… oci-ampe… GITEA-ACTIONS-TA… 9… 1… 99… 910… 1.… 6.0…  0B / 0B 24.6K… 70 
+ 318da7… default   ai-memory         4… 2… 20… 132… 0.… 512… 44.6M /… 7.35G…  8 
+ 99e791… default   nginx-proxy-mana… 1… 2… 5.… 57.… 0.… 256… 1.55M /… 104M …  7 
+ 1943ca… default   jackui            1… 9… 3.… 285… 2.… 3.0… 4.08G /… 3.19G… 10 
+ 1943ca… homeserv… jackui            1… 9… 3.… 288… 2.… 3.0… 4.08G /… 3.2G … 10 
+ 4526d4… oci-ampe… gitea             1… 1… 2.… 270… 2.… 2.0… 30.1G /… 115G … 19 
+ c92a8c… homeserv… frankmega         1… 3… 1.… 321… 1.… 1.0… 1.65M /… 1.12G… 46 
+ 8e99b2… default   Glances           3… 1… 1.… 46.… 0.… 256…  0B / 0B 36.6M… 58 
+ 292c40… default   cadvisor          2… 1… 1.… 33.… 0.… 320…  0B / 0B 320M … 13 
+ b9db61… oci-ampe… gitea-mariadb-1   1… 8… 1.… 91.… 1.… 1.0… 6.84G /… 1.59G… 33 
+ 99e791… homeserv… nginx-proxy-mana… 2… 2… 1.… 57.… 0.… 256… 1.55M /… 104M …  7 
+ b45c30… homeserv… frank_investigat… 0… 1… 1.… 295… 2.… 1.5… 976K / … 1.39G… 25 
+ 965aa8… default   jackui-postgres   1… 8… 0.… 42.… 0.… 512… 4.08G /… 183M …  8 
+ c92a8c… default   frankmega         0… 3… 0.… 321… 1.… 1.0… 1.65M /… 1.12G… 46 
+ e4577e… homeserv… immich-redis      1… 5… 0.… 13.… 0.… 256… 778M / … 22.4M…  7 
+ b45c30… default   frank_investigat… 0… 1… 0.… 295… 2.… 1.5… 976K / … 1.39G… 25 
+ 0ee372… default   immich-server     0… 1… 0.… 569… 2.… 4.0… 4.42G /… 2.81G… 25 
+ 8349ee… default   e2erepro-db-1     0… 6… 0.… 61.… 2.… 1.0… 47.4M /… 46.5M… 18 
+ 060e33… default   gluetun           0… 7… 0.… 39.… 1.… 512… 4.08G /… 453M … 11 
+ 2ba969… oci-ampe… redis-dev         1… 2… 0.… 2.6… 0.… 128… 2.03K /… 520K …  6 
+ e4577e… default   immich-redis      0… 5… 0.… 13.… 0.… 256… 778M / … 22.4M…  7 
+ ebfd05… homeserv… vault             1… 6… 0.… 32.… 0.… 512… 2.37M /… 1.82G…  9 
+ 5ca568… homeserv… cloudflared       0… 1… 0.… 19.… 0.… 128… 869M / … 226M …  8 
+ c58a81… oci-ampe… sonarqube-arm-st… 0… 4… 0.… 1.6… 1.… 4.0… 365M / … 546M … 1… 
+ bd1942… oci-ampe… sonarqube-arm-pr… 0… 5… 0.… 2.2… 1.… 4.0… 492M / … 512M … 1… 
+ 9dd9fa… oci-ampe… mysql-dev         0… 1… 0.… 19.… 0.… 1.0… 1.86K /… 35.4M… 34 
+ ebfd05… default   vault             0… 6… 0.… 32.… 0.… 512… 2.37M /… 1.82G…  9 
+ 99201e… oci-ampe… portainer_agent.… 0… 2… 0.… 32.… 0.… 128… 254M / … 308M …  6 
+ 9eb8a1… homeserv… gitea-ssh-forward 0… 4… 0.… 2.9… 0.… 64.…  0B / 0B 3.03M…  4 
+ 628010… homeserv… sonarr            0… 2… 0.… 145… 1.… 512… 246M / … 955M … 25 
+ a2ee4d… default   immich-ml         0… 2… 0.… 77.… 1.… 3.0… 5.45M /… 1.92G… 12 
+ 1053ed… oci-ampe… portainer_agent.… 0… 3… 0.… 39.… 0.… 128… 283M / … 63.6M…  6 
+╭────────────────────────────── Atalhos Rápidos ───────────────────────────────╮
+│ Atalhos:    Filtro Nenhum (aperte [f] para filtrar) | Tab Mudar Ctx <-/->    │
+│             Col  x/m Rel  c/u/l Fis/Lim  +/- Refresh  f Filt  q Sair         │
+╰──────────────────────────────────────────────────────────────────────────────╯

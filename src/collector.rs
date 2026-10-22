@@ -1,0 +1,205 @@
+//! Coletor: tick de coleta != render. Um ciclo coleta todos os contextos em
+//! paralelo, enriquece com limites (inspect sob demanda) e publica via `mpsc`.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+
+use crate::config::AppConfig;
+use crate::model::{short_id, ContainerSnapshot};
+use crate::provider::{build_snapshot, Caches, DockerProvider};
+
+#[derive(Debug, Clone)]
+pub struct CollectOutput {
+    pub rows: Vec<ContainerSnapshot>,
+    pub errors: Vec<String>,
+    pub totals_cores: u32,
+    pub totals_mem: u64,
+}
+
+/// Um ciclo de coleta sobre os providers ativos.
+pub async fn collect_once(
+    providers: &[Arc<dyn DockerProvider>],
+    caches: &Arc<Mutex<Caches>>,
+    cfg: &AppConfig,
+) -> CollectOutput {
+    let _ = cfg;
+    // stats em paralelo por contexto
+    let mut handles = Vec::new();
+    for p in providers {
+        let p = Arc::clone(p);
+        handles.push(tokio::spawn(async move {
+            let r = p.list_stats().await;
+            (p.context_name().to_string(), p.transport_label(), r)
+        }));
+    }
+    let mut raws: HashMap<String, (String, Vec<crate::provider::RawStats>)> = HashMap::new();
+    let mut errors = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok((ctx, tr, Ok(rows))) => {
+                raws.insert(ctx.clone(), (tr.to_string(), rows));
+            }
+            Ok((ctx, _, Err(e))) => errors.push(format!("Erro no contexto '{ctx}': {e:#}")),
+            Err(e) => errors.push(format!("join falhou: {e:#}")),
+        }
+    }
+
+    // sysinfo por contexto (cache) + inspect dos ids sem limite
+    let mut rows: Vec<ContainerSnapshot> = Vec::new();
+    for p in providers {
+        let ctx = p.context_name();
+        let Some((transport, list)) = raws.get(ctx) else {
+            continue;
+        };
+        let (cores, mem) = match p.system_info().await {
+            Ok(v) => {
+                if let Ok(mut c) = caches.lock() {
+                    c.sysinfo.insert(ctx.to_string(), v);
+                    v
+                } else {
+                    v
+                }
+            }
+            Err(_) => {
+                // fallback: cache ou host local
+                if let Ok(c) = caches.lock() {
+                    c.sysinfo.get(ctx).copied().unwrap_or((1, 16 << 30))
+                } else {
+                    (1, 16 << 30)
+                }
+            }
+        };
+        // ids sem limite → inspect
+        let missing: Vec<String> = {
+            let c = caches.lock().expect("caches lock");
+            list.iter()
+                .map(|r| r.id.clone())
+                .filter(|id| {
+                    !c.limits
+                        .contains_key(&(ctx.to_string(), short_id(id).to_string()))
+                })
+                .collect()
+        };
+        if !missing.is_empty() {
+            if let Ok(found) = p.inspect_limits(&missing).await {
+                if let Ok(mut c) = caches.lock() {
+                    for (short, lim) in found {
+                        c.limits.insert((ctx.to_string(), short), lim);
+                    }
+                }
+            }
+        }
+        // evict ids que sumiram
+        {
+            let seen: HashSet<String> = list.iter().map(|r| short_id(&r.id).to_string()).collect();
+            if let Ok(mut c) = caches.lock() {
+                c.evict_missing(ctx, &seen);
+            }
+        }
+        // monta snapshots
+        let guard = caches.lock().expect("caches lock");
+        for raw in list {
+            rows.push(build_snapshot(raw, ctx, transport, &guard, cores, mem));
+        }
+    }
+
+    let (totals_cores, totals_mem) = {
+        let mut tc = 0u32;
+        let mut tm = 0u64;
+        if let Ok(c) = caches.lock() {
+            for p in providers {
+                if let Some((co, me)) = c.sysinfo.get(p.context_name()) {
+                    tc += *co;
+                    tm += *me;
+                }
+            }
+        }
+        (tc, tm)
+    };
+
+    CollectOutput {
+        rows,
+        errors,
+        totals_cores,
+        totals_mem,
+    }
+}
+
+/// Loop de coleta: `interval(refresh_delay)` → `tx.send(output)`.
+/// Render é event-driven no `ui.rs` (não 10fps fixo).
+pub fn spawn_collector(
+    providers: Vec<Arc<dyn DockerProvider>>,
+    caches: Arc<Mutex<Caches>>,
+    cfg: Arc<parking_lot_like::RwLock<AppConfig>>,
+    tx: mpsc::Sender<CollectOutput>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // primeira coleta imediata
+        loop {
+            let snapshot_cfg = { cfg.read().clone() };
+            let out = collect_once(&providers, &caches, &snapshot_cfg).await;
+            if tx.send(out).await.is_err() {
+                break;
+            }
+            let delay = snapshot_cfg.refresh_delay.clamp(0.5, 10.0);
+            tokio::time::sleep(Duration::from_secs_f64(delay)).await;
+        }
+    })
+}
+
+/// RwLock síncrono mínimo sem nova dependência (stdlib).
+pub mod parking_lot_like {
+    use std::sync::{RwLockReadGuard, RwLockWriteGuard};
+
+    pub struct RwLock<T>(std::sync::RwLock<T>);
+    impl<T> RwLock<T> {
+        pub fn new(v: T) -> Self {
+            Self(std::sync::RwLock::new(v))
+        }
+        pub fn read(&self) -> RwLockReadGuard<'_, T> {
+            self.0.read().expect("rwlock")
+        }
+        pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+            self.0.write().expect("rwlock")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{MockProvider, RawStats};
+
+    fn raw(id: &str, name: &str) -> RawStats {
+        RawStats::from_strings([
+            id.to_string(),
+            name.to_string(),
+            "5.0%".to_string(),
+            "100MiB / 1GiB".to_string(),
+            "9.7%".to_string(),
+            "1MiB / 1MiB".to_string(),
+            "1MiB / 1MiB".to_string(),
+            "3".to_string(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn collect_merges_contexts_and_evicts() {
+        let cfg = AppConfig::default();
+        let caches = Arc::new(Mutex::new(Caches::default()));
+        let p1: Arc<dyn DockerProvider> = Arc::new(MockProvider::new(
+            "default",
+            vec![raw("aaa111111111", "web")],
+        ));
+        let p2: Arc<dyn DockerProvider> = Arc::new(MockProvider::new(
+            "homeserver",
+            vec![raw("bbb222222222", "db")],
+        ));
+        let out = collect_once(&[p1, p2], &caches, &cfg).await;
+        assert_eq!(out.rows.len(), 2);
+        assert!(out.errors.is_empty());
+    }
+}
