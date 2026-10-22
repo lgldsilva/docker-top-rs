@@ -114,13 +114,42 @@ fn decide_transport(endpoint: &str) -> Transport {
     }
 }
 
+/// Resolve o binário `docker` fora do PATH mínimo do SSH não-interativo.
+/// Ordem: PATH (`docker --version` ok) → /opt/homebrew/bin/docker (mac arm64)
+/// → /usr/local/bin/docker (mac intel/OrbStack) → ~/.docker/bin/docker
+/// (Docker Desktop) → /usr/bin/docker (linux). Fallback: `"docker"`.
+pub fn resolve_docker_bin() -> PathBuf {
+    if std::process::Command::new("docker")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return PathBuf::from("docker");
+    }
+    let mut candidates: Vec<PathBuf> = vec![
+        PathBuf::from("/opt/homebrew/bin/docker"),
+        PathBuf::from("/usr/local/bin/docker"),
+        PathBuf::from("/usr/bin/docker"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".docker/bin/docker"));
+    }
+    for c in candidates {
+        if c.is_file() {
+            return c;
+        }
+    }
+    PathBuf::from("docker")
+}
+
 /// Descobre contextos no startup: `docker context ls` + meta.json.
 /// Fallback: `["default"]` (unix socket) se o CLI falhar.
 pub async fn discover(context_ls_timeout: Duration) -> DiscoveredContexts {
     let base: PathBuf = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("~"))
         .join(".docker/contexts/meta");
-    discover_with(std::path::Path::new("docker"), &base, context_ls_timeout).await
+    discover_with(&resolve_docker_bin(), &base, context_ls_timeout).await
 }
 
 /// Variante testável com binário e base de meta explícitos (sem PATH/env global).

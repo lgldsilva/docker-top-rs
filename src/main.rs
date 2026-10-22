@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
     let stats_t = Duration::from_secs_f64(cfg.timeouts.stats.max(1.0));
     let inspect_t = Duration::from_secs_f64(cfg.timeouts.inspect.max(1.0));
     let info_t = Duration::from_secs_f64(cfg.timeouts.info.max(1.0));
+    let docker_bin = transport::resolve_docker_bin();
     let providers: Vec<Arc<dyn DockerProvider>> = discovered
         .contexts
         .iter()
@@ -63,9 +64,10 @@ async fn main() -> anyhow::Result<()> {
                     stats_t,
                     inspect_t,
                 )),
-                transport::Transport::Cli => {
-                    Arc::new(CliProvider::new(c.name.clone(), stats_t, inspect_t, info_t))
-                }
+                transport::Transport::Cli => Arc::new(
+                    CliProvider::new(c.name.clone(), stats_t, inspect_t, info_t)
+                        .with_bin(docker_bin.clone()),
+                ),
             }
         })
         .collect();
