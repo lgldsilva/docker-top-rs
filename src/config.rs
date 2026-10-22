@@ -287,7 +287,11 @@ impl AppConfig {
         }
         Figment::from(Serialized::defaults(AppConfig::default()))
             .merge(Toml::file(config_path))
-            .merge(Env::prefixed("DOCKER_TOP_").split("__"))
+            .merge(
+                Env::prefixed("DOCKER_TOP_")
+                    .split("__")
+                    .ignore(&["DELAY", "SORT", "ASC", "FILTER", "CONTEXT", "CONFIG"]),
+            )
             .merge(Serialized::defaults(cli_map))
     }
 

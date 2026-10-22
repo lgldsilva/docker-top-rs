@@ -175,7 +175,7 @@ async fn run_tui(
                 terminal.draw(|f| ui::render(f, &state, &cfg))?;
             }
             Some(Ok(ev)) = events.next() => {
-                if handle_event(ev, &mut state, &mut cfg, &cli, &config_path)? {
+                if handle_event(ev, &mut state, &mut cfg, &cli, &config_path, &cfg_shared)? {
                     break;
                 }
                 terminal.draw(|f| ui::render(f, &state, &cfg))?;
@@ -209,6 +209,7 @@ fn handle_event(
     cfg: &mut AppConfig,
     cli: &Cli,
     config_path: &std::path::Path,
+    cfg_shared: &Arc<parking_lot_like::RwLock<AppConfig>>,
 ) -> anyhow::Result<bool> {
     let Event::Key(key) = ev else {
         return Ok(false); // resize/mouse → só re-render
@@ -266,10 +267,7 @@ fn handle_event(
             let s = c.to_string();
             // R maiúsculo = reload (r minúsculo = sort net) — case-sensitive de propósito.
             if s == kb.reload_config {
-                let shared = parking_lot_like::RwLock::new(cfg.clone());
-                let shared = Arc::new(shared);
-                reload_cfg(cli, config_path, cfg, &shared, state);
-                cfg.clone_from(&shared.read().clone());
+                reload_cfg(cli, config_path, cfg, cfg_shared, state);
             } else if s == kb.quit {
                 return Ok(true);
             } else if s == kb.filter {

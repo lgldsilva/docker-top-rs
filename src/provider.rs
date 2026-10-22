@@ -124,16 +124,14 @@ impl CliProvider {
     }
 
     async fn run_docker(&self, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-        let fut = tokio::process::Command::new(&self.bin)
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("spawn {} {}", self.bin.display(), args.join(" ")))?;
-        let out = tokio::time::timeout(timeout, async { Ok::<_, anyhow::Error>(fut) })
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.args(args).kill_on_drop(true);
+        let out = tokio::time::timeout(timeout, cmd.output())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("timeout {}s: docker {}", timeout.as_secs(), args.join(" "))
-            })??;
+            })?
+            .with_context(|| format!("spawn {} {}", self.bin.display(), args.join(" ")))?;
         if !out.status.success() {
             anyhow::bail!(
                 "docker {} falhou: {}",
