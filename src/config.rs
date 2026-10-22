@@ -394,4 +394,47 @@ mod tests {
         let cfg = AppConfig::load(&cli, &p).unwrap();
         assert!((cfg.thresholds.warn - 60.0).abs() < f64::EPSILON);
     }
+
+    #[test]
+    fn example_roundtrip_loads_clean() {
+        let dir = std::env::temp_dir().join(format!("dtex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.example.toml");
+        generate_example_file(&p).unwrap();
+        let cli = test_cli();
+        let cfg = AppConfig::load(&cli, &p).unwrap();
+        assert!((cfg.refresh_delay - 2.0).abs() < f64::EPSILON);
+        assert_eq!(cfg.sort, "cpu");
+    }
+
+    #[test]
+    fn reload_applies_file_changes() {
+        let dir = std::env::temp_dir().join(format!("dtrel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(&p, "refresh_delay = 2.0\n").unwrap();
+        let cli = test_cli();
+        let mut cfg = AppConfig::load(&cli, &p).unwrap();
+        std::fs::write(&p, "refresh_delay = 4.0\n").unwrap();
+        cfg.reload(&cli, &p).unwrap();
+        assert!((cfg.refresh_delay - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn invalid_sort_rejected() {
+        let dir = std::env::temp_dir().join(format!("dtbad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.toml");
+        std::fs::write(&p, "sort = \"nope\"\n").unwrap();
+        let cli = test_cli();
+        assert!(AppConfig::load(&cli, &p).is_err());
+    }
+
+    #[test]
+    fn helper_paths_nonempty() {
+        assert!(default_config_path()
+            .to_string_lossy()
+            .contains("docker-top"));
+        assert_eq!(example_config_path(), PathBuf::from("config.example.toml"));
+    }
 }

@@ -465,4 +465,29 @@ mod tests {
         assert!(s.contains("default:api"));
         assert!(s.contains("homeserver:cli"));
     }
+
+    #[test]
+    fn render_error_and_filter_edit_states() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (mut state, cfg) = sample_state();
+        state.errors = vec!["Timeout ao conectar ao contexto 'x'".to_string()];
+        state.editing_filter = true;
+        state.filter_draft = "we".to_string();
+        let backend = TestBackend::new(170, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+        let text = terminal.backend().to_string();
+        assert!(text.contains("editando"));
+    }
+
+    #[test]
+    fn effective_columns_hides_context_when_single() {
+        let (mut state, cfg) = sample_state();
+        state.selected_context = "default".to_string();
+        let cols = effective_columns(&state, &cfg, 200);
+        assert!(!cols.contains(&"context".to_string()));
+        let rows = state.visible_rows(&cfg, 200);
+        assert!(rows.iter().all(|r| r.context == "default"));
+    }
 }

@@ -8,6 +8,7 @@
 //! mais cache `SystemInfo` por contexto.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +100,7 @@ pub type SharedCaches = Arc<Mutex<Caches>>;
 
 pub struct CliProvider {
     context: String,
+    bin: PathBuf,
     stats_timeout: Duration,
     inspect_timeout: Duration,
     info_timeout: Duration,
@@ -108,18 +110,25 @@ impl CliProvider {
     pub fn new(context: String, stats: Duration, inspect: Duration, info: Duration) -> Self {
         Self {
             context,
+            bin: PathBuf::from("docker"),
             stats_timeout: stats,
             inspect_timeout: inspect,
             info_timeout: info,
         }
     }
 
+    /// Binário alternativo (testes com `docker` fake — sem PATH global).
+    pub fn with_bin(mut self, bin: PathBuf) -> Self {
+        self.bin = bin;
+        self
+    }
+
     async fn run_docker(&self, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-        let fut = tokio::process::Command::new("docker")
+        let fut = tokio::process::Command::new(&self.bin)
             .args(args)
             .output()
             .await
-            .with_context(|| format!("spawn docker {}", args.join(" ")))?;
+            .with_context(|| format!("spawn {} {}", self.bin.display(), args.join(" ")))?;
         let out = tokio::time::timeout(timeout, async { Ok::<_, anyhow::Error>(fut) })
             .await
             .map_err(|_| {
@@ -575,6 +584,25 @@ pub fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    /// Escreve um `docker` fake executável e retorna seu caminho + dir p/ limpeza.
+    fn fake_docker_bin(tag: &str, script: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("dtcli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        let mut f = std::fs::File::create(&bin).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (bin, dir)
+    }
 
     #[test]
     fn cache_evict_missing() {
@@ -624,5 +652,105 @@ mod tests {
         assert_eq!(m.list_stats().await.unwrap().len(), 1);
         let (c, mm) = m.system_info().await.unwrap();
         assert_eq!((c, mm), (4, 8 * 1024 * 1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn cli_provider_lists_stats_and_info_with_fake_docker() {
+        let script = "#!/bin/sh\nif printf '%s' \"$*\" | grep -q 'stats'; then printf 'abcdef123456\\tweb\\t5.0%%\\t100MiB / 1GiB\\t9.7%%\\t1MiB / 1MiB\\t1MiB / 1MiB\\t3\\n'; elif printf '%s' \"$*\" | grep -q 'inspect'; then printf 'abcdef1234567890\\t0\\t0\\t0\\t\\t536870912\\n'; elif printf '%s' \"$*\" | grep -q 'info'; then printf '4\\t8589934592\\n'; else exit 1; fi\n";
+        let (bin, dir) = fake_docker_bin("ok", script);
+        let p = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .with_bin(bin);
+        let rows = p.list_stats().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        let (cores, mem) = p.system_info().await.unwrap();
+        assert_eq!((cores, mem), (4, 8589934592));
+        let lim = p
+            .inspect_limits(&["abcdef123456".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(lim.len(), 1);
+        assert!((lim[0].1.mem_limit - 536870912.0).abs() < 1.0);
+        let empty = p.inspect_limits(&[]).await.unwrap();
+        assert!(empty.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_info_error_propagates() {
+        let (bin, dir) = fake_docker_bin("fail", "#!/bin/sh\nexit 1\n");
+        let p = CliProvider::new(
+            "ctxdown".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .with_bin(bin);
+        assert!(p.system_info().await.is_err());
+        assert!(p.list_stats().await.is_err());
+        assert!(p
+            .inspect_limits(&["zzz".to_string()])
+            .await
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bollard contra o daemon real (pula sem socket — documentado).
+    #[tokio::test]
+    async fn bollard_live_daemon_if_available() {
+        if !std::path::Path::new("/var/run/docker.sock").exists() {
+            eprintln!("pulando teste Bollard: sem /var/run/docker.sock");
+            return;
+        }
+        let p = BollardProvider::new(
+            "default".into(),
+            "unix:///var/run/docker.sock".into(),
+            Duration::from_secs(10),
+        );
+        assert_eq!(p.transport_label(), "api");
+        let (cores, mem) = p.system_info().await.expect("daemon info");
+        assert!(cores >= 1 && mem > 0);
+        let rows = p.list_stats().await.expect("daemon stats");
+        assert!(
+            !rows.is_empty(),
+            "esperava ao menos 1 container no daemon local"
+        );
+        let ids: Vec<String> = rows.iter().take(2).map(|r| r.id.clone()).collect();
+        let lim = p.inspect_limits(&ids).await.expect("daemon inspect");
+        assert!(!lim.is_empty());
+    }
+
+    #[test]
+    fn build_snapshot_prefers_bollard_numbers_and_evicts() {
+        let caches = Caches::default();
+        let mut raw = RawStats::from_strings([
+            "abcdef123456".into(),
+            "web".into(),
+            "xx".into(),
+            "yy".into(),
+            "zz".into(),
+            "aa".into(),
+            "bb".into(),
+            "cc".into(),
+        ]);
+        raw.cpu = Some(25.0);
+        raw.mem_used = Some(100.0 * 1024.0 * 1024.0);
+        raw.mem_limit_stats = Some(1024.0 * 1024.0 * 1024.0);
+        raw.net_rx = Some(10.0);
+        raw.net_tx = Some(20.0);
+        raw.block_read = Some(30.0);
+        raw.block_write = Some(40.0);
+        raw.pids = Some(9);
+        let s = build_snapshot(&raw, "default", "api", &caches, 4, 8 * 1024 * 1024 * 1024);
+        assert!((s.cpu - 25.0).abs() < 1e-9);
+        assert_eq!(s.pids, 9);
+        assert!((s.net_total() - 30.0).abs() < 1e-9);
+        assert!((s.block_total() - 70.0).abs() < 1e-9);
     }
 }

@@ -173,6 +173,30 @@ mod tests {
     use super::*;
     use crate::provider::{MockProvider, RawStats};
 
+    struct FailingProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl DockerProvider for FailingProvider {
+        fn context_name(&self) -> &str {
+            self.0
+        }
+        fn transport_label(&self) -> &'static str {
+            "cli"
+        }
+        async fn list_stats(&self) -> anyhow::Result<Vec<RawStats>> {
+            anyhow::bail!("daemon down")
+        }
+        async fn inspect_limits(
+            &self,
+            _ids: &[String],
+        ) -> anyhow::Result<Vec<(String, crate::model::ContainerLimits)>> {
+            Ok(vec![])
+        }
+        async fn system_info(&self) -> anyhow::Result<(u32, u64)> {
+            anyhow::bail!("daemon down")
+        }
+    }
+
     fn raw(id: &str, name: &str) -> RawStats {
         RawStats::from_strings([
             id.to_string(),
@@ -201,5 +225,37 @@ mod tests {
         let out = collect_once(&[p1, p2], &caches, &cfg).await;
         assert_eq!(out.rows.len(), 2);
         assert!(out.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_reports_errors_when_all_down() {
+        let cfg = AppConfig::default();
+        let caches = Arc::new(Mutex::new(Caches::default()));
+        let p: Arc<dyn DockerProvider> = Arc::new(FailingProvider("ctxdown"));
+        let out = collect_once(std::slice::from_ref(&p), &caches, &cfg).await;
+        assert!(out.rows.is_empty());
+        assert!(!out.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_emits_at_least_one_batch() {
+        let cfg = AppConfig {
+            refresh_delay: 0.01,
+            ..AppConfig::default()
+        };
+        let shared = Arc::new(parking_lot_like::RwLock::new(cfg));
+        let caches = Arc::new(Mutex::new(Caches::default()));
+        let p: Arc<dyn DockerProvider> = Arc::new(MockProvider::new(
+            "default",
+            vec![raw("aaa111111111", "web")],
+        ));
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = spawn_collector(vec![p], caches, shared, tx);
+        let out = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("canal");
+        assert_eq!(out.rows.len(), 1);
+        handle.abort();
     }
 }

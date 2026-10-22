@@ -364,4 +364,62 @@ mod tests {
         assert_eq!(normalize_sort("block_write", &vis), "block");
         assert_eq!(normalize_sort("pids", &vis), "net");
     }
+
+    #[test]
+    fn inspect_branches_nano_quota_cpuset_fallback() {
+        // nano_cpus manda
+        let l = ContainerLimits::from_inspect(2_000_000_000, 0, 0, "", 0, 8, 16 << 30);
+        assert!((l.cpu_limit - 2.0).abs() < 1e-9 && l.has_cpu_limit);
+        // quota/period
+        let l = ContainerLimits::from_inspect(0, 200000, 100000, "", 0, 8, 16 << 30);
+        assert!((l.cpu_limit - 2.0).abs() < 1e-9 && l.has_cpu_limit);
+        // cpuset
+        let l = ContainerLimits::from_inspect(0, 0, 0, "0-3", 0, 8, 16 << 30);
+        assert!((l.cpu_limit - 4.0).abs() < 1e-9 && l.has_cpu_limit);
+        // fallback host + mem do stats
+        let l = ContainerLimits::from_inspect(0, 0, 0, "", 0, 8, 16 << 30);
+        assert!(!l.has_cpu_limit && !l.has_mem_limit);
+        let l = ContainerLimits::fallback(8, 16 << 30, 1.0 * 1024.0 * 1024.0 * 1024.0);
+        assert!(l.has_mem_limit && !l.has_cpu_limit);
+    }
+
+    #[test]
+    fn short_id_and_apply_limits() {
+        assert_eq!(short_id("abcdef1234567890"), "abcdef123456");
+        assert_eq!(short_id("abc"), "abc");
+        let mut rows = sample();
+        let lim = ContainerLimits {
+            cpu_limit: 2.0,
+            has_cpu_limit: true,
+            mem_limit: 2.0 * 1024.0 * 1024.0 * 1024.0,
+            has_mem_limit: true,
+        };
+        rows[0].apply_limits(&lim);
+        assert!((rows[0].cpu_limit - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn visible_columns_all_bands() {
+        let cfg = crate::config::AppConfig::default();
+        let ultra = visible_columns(
+            80,
+            cfg.layout.compact_width,
+            cfg.layout.wide_width,
+            &cfg.columns,
+        );
+        let compact = visible_columns(
+            120,
+            cfg.layout.compact_width,
+            cfg.layout.wide_width,
+            &cfg.columns,
+        );
+        let full = visible_columns(
+            200,
+            cfg.layout.compact_width,
+            cfg.layout.wide_width,
+            &cfg.columns,
+        );
+        assert!(ultra.len() < compact.len() && compact.len() < full.len());
+        assert!(!normalize_sort("pids", &[]).is_empty());
+    }
 }
