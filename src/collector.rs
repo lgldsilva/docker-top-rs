@@ -156,17 +156,31 @@ pub async fn collect_once(
 
 /// Loop de coleta: `interval(refresh_delay)` → `tx.send(output)`.
 /// Render é event-driven no `ui.rs` (não 10fps fixo).
+/// Filtra providers pelo contexto selecionado (igual Python); Tab atualiza o shared.
 pub fn spawn_collector(
     providers: Vec<Arc<dyn DockerProvider>>,
     caches: Arc<Mutex<Caches>>,
     cfg: Arc<parking_lot_like::RwLock<AppConfig>>,
+    selected: Arc<Mutex<String>>,
     tx: mpsc::Sender<CollectOutput>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // primeira coleta imediata
         loop {
             let snapshot_cfg = { cfg.read().clone() };
-            let out = collect_once(&providers, &caches, &snapshot_cfg).await;
+            let sel = {
+                selected
+                    .lock()
+                    .ok()
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|| "all".to_string())
+            };
+            let active: Vec<Arc<dyn DockerProvider>> = providers
+                .iter()
+                .filter(|p| sel == "all" || p.context_name() == sel)
+                .cloned()
+                .collect();
+            let out = collect_once(&active, &caches, &snapshot_cfg).await;
             if tx.send(out).await.is_err() {
                 break;
             }
@@ -276,7 +290,8 @@ mod tests {
             vec![raw("aaa111111111", "web")],
         ));
         let (tx, mut rx) = mpsc::channel(4);
-        let handle = spawn_collector(vec![p], caches, shared, tx);
+        let selected = Arc::new(Mutex::new("all".to_string()));
+        let handle = spawn_collector(vec![p], caches, shared, selected, tx);
         let out = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("timeout")

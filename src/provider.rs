@@ -281,7 +281,7 @@ pub struct BollardProvider {
     context: String,
     #[allow(dead_code)]
     socket: String,
-    docker: bollard::Docker,
+    docker: Option<bollard::Docker>,
     info_timeout: Duration,
     stats_timeout: Duration,
     inspect_timeout: Duration,
@@ -303,8 +303,9 @@ impl BollardProvider {
             .strip_prefix("unix://")
             .unwrap_or(&socket)
             .to_string();
-        let docker = bollard::Docker::connect_with_socket(&path, 10, bollard::API_DEFAULT_VERSION)
-            .expect("bollard connect unix socket");
+        // Sem panic: sem socket (ex. Mac sem Docker Desktop) vira erro tratável no collect.
+        let docker =
+            bollard::Docker::connect_with_socket(&path, 10, bollard::API_DEFAULT_VERSION).ok();
         Self {
             context,
             socket,
@@ -316,7 +317,9 @@ impl BollardProvider {
     }
 
     fn connect(&self) -> anyhow::Result<bollard::Docker> {
-        Ok(self.docker.clone())
+        self.docker
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("sem socket docker em {}", self.socket))
     }
 }
 

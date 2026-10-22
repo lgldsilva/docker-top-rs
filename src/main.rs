@@ -98,8 +98,14 @@ async fn run_once(
     discovered: &transport::DiscoveredContexts,
     selected: &str,
 ) -> anyhow::Result<()> {
+    // Igual ao Python: coleta só o contexto selecionado (all = todos).
+    let active: Vec<Arc<dyn DockerProvider>> = providers
+        .iter()
+        .filter(|p| selected == "all" || p.context_name() == selected)
+        .cloned()
+        .collect();
     let caches = Arc::new(Mutex::new(Caches::default()));
-    let out = collect_once(providers, &caches, cfg).await;
+    let out = collect_once(&active, &caches, cfg).await;
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(200);
     let state = ui::AppState {
         rows: out.rows,
@@ -131,9 +137,15 @@ async fn run_tui(
 ) -> anyhow::Result<()> {
     let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
     let caches = Arc::new(Mutex::new(Caches::default()));
+    let selected_shared = Arc::new(Mutex::new(initial_context.clone()));
     let (tx, mut rx) = mpsc::channel::<CollectOutput>(4);
-    let _collector =
-        collector::spawn_collector(providers, Arc::clone(&caches), Arc::clone(&cfg_shared), tx);
+    let _collector = collector::spawn_collector(
+        providers,
+        Arc::clone(&caches),
+        Arc::clone(&cfg_shared),
+        Arc::clone(&selected_shared),
+        tx,
+    );
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -186,7 +198,15 @@ async fn run_tui(
                 terminal.draw(|f| ui::render(f, &state, &cfg))?;
             }
             Some(Ok(ev)) = events.next() => {
-                if handle_event(ev, &mut state, &mut cfg, &cli, &config_path, &cfg_shared)? {
+                if handle_event(
+                    ev,
+                    &mut state,
+                    &mut cfg,
+                    &cli,
+                    &config_path,
+                    &cfg_shared,
+                    &selected_shared,
+                )? {
                     break;
                 }
                 terminal.draw(|f| ui::render(f, &state, &cfg))?;
@@ -221,6 +241,7 @@ fn handle_event(
     cli: &Cli,
     config_path: &std::path::Path,
     cfg_shared: &Arc<parking_lot_like::RwLock<AppConfig>>,
+    selected_shared: &Arc<Mutex<String>>,
 ) -> anyhow::Result<bool> {
     let Event::Key(key) = ev else {
         return Ok(false); // resize/mouse → só re-render
@@ -256,7 +277,7 @@ fn handle_event(
     let kb = &cfg.keybindings;
     // Tab → próximo contexto (também `o` configurável)
     if key.code == KeyCode::Tab {
-        cycle_context(state);
+        cycle_context(state, selected_shared);
         return Ok(false);
     }
     match key.code {
@@ -319,7 +340,7 @@ fn handle_event(
             } else if s == kb.sort_block {
                 state.sort_by = "block".into();
             } else if s == kb.next_context {
-                cycle_context(state);
+                cycle_context(state, selected_shared);
             } else if s == kb.refresh_inc {
                 cfg.refresh_delay = (cfg.refresh_delay + 0.5).min(10.0);
             } else if s == kb.refresh_dec {
@@ -331,7 +352,7 @@ fn handle_event(
     Ok(false)
 }
 
-fn cycle_context(state: &mut ui::AppState) {
+fn cycle_context(state: &mut ui::AppState, selected_shared: &Arc<Mutex<String>>) {
     let mut options: Vec<String> = vec!["all".to_string()];
     options.extend(state.contexts.iter().map(|c| c.name.clone()));
     let idx = options
@@ -339,6 +360,9 @@ fn cycle_context(state: &mut ui::AppState) {
         .position(|o| *o == state.selected_context)
         .unwrap_or(0);
     state.selected_context = options[(idx + 1) % options.len()].clone();
+    if let Ok(mut s) = selected_shared.lock() {
+        *s = state.selected_context.clone();
+    }
     state.rows.clear();
 }
 
