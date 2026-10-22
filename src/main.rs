@@ -56,10 +56,12 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .map(|c| -> Arc<dyn DockerProvider> {
             match c.transport {
-                transport::Transport::Api => Arc::new(provider::BollardProvider::new(
+                transport::Transport::Api => Arc::new(provider::BollardProvider::new_full(
                     c.name.clone(),
                     c.endpoint.clone(),
                     info_t,
+                    stats_t,
+                    inspect_t,
                 )),
                 transport::Transport::Cli => {
                     Arc::new(CliProvider::new(c.name.clone(), stats_t, inspect_t, info_t))
@@ -136,6 +138,15 @@ async fn run_tui(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    // RAII: garante restore do terminal em panic/early-return.
+    struct TermGuard;
+    impl Drop for TermGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = std::io::stdout().execute(crossterm::terminal::LeaveAlternateScreen);
+        }
+    }
+    let _guard = TermGuard;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 

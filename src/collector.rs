@@ -47,28 +47,54 @@ pub async fn collect_once(
         }
     }
 
-    // sysinfo por contexto (cache) + inspect dos ids sem limite
+    // sysinfo por contexto (cache TTL 60s) + inspect dos ids sem limite
     let mut rows: Vec<ContainerSnapshot> = Vec::new();
     for p in providers {
         let ctx = p.context_name();
         let Some((transport, list)) = raws.get(ctx) else {
             continue;
         };
-        let (cores, mem) = match p.system_info().await {
-            Ok(v) => {
-                if let Ok(mut c) = caches.lock() {
-                    c.sysinfo.insert(ctx.to_string(), v);
-                    v
+        let (cores, mem) = {
+            let cached = caches.lock().ok().and_then(|c| {
+                let ts_ok = c
+                    .sysinfo_ts
+                    .get(ctx)
+                    .map(|t| t.elapsed() < crate::provider::SYSINFO_TTL)
+                    .unwrap_or(false);
+                if ts_ok {
+                    c.sysinfo.get(ctx).copied()
                 } else {
-                    v
+                    None
                 }
-            }
-            Err(_) => {
-                // fallback: cache ou host local
-                if let Ok(c) = caches.lock() {
-                    c.sysinfo.get(ctx).copied().unwrap_or((1, 16 << 30))
-                } else {
-                    (1, 16 << 30)
+            });
+            if let Some(v) = cached {
+                v
+            } else {
+                match p.system_info().await {
+                    Ok(v) => {
+                        if let Ok(mut c) = caches.lock() {
+                            c.sysinfo.insert(ctx.to_string(), v);
+                            c.sysinfo_ts
+                                .insert(ctx.to_string(), std::time::Instant::now());
+                            v
+                        } else {
+                            v
+                        }
+                    }
+                    Err(_) => {
+                        // fallback: cache ou host local
+                        if let Ok(c) = caches.lock() {
+                            c.sysinfo.get(ctx).copied().unwrap_or((
+                                crate::provider::FALLBACK_CORES,
+                                crate::provider::FALLBACK_MEM,
+                            ))
+                        } else {
+                            (
+                                crate::provider::FALLBACK_CORES,
+                                crate::provider::FALLBACK_MEM,
+                            )
+                        }
+                    }
                 }
             }
         };

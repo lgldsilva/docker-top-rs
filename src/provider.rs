@@ -82,7 +82,12 @@ pub trait DockerProvider: Send + Sync {
 pub struct Caches {
     pub limits: HashMap<(String, String), ContainerLimits>,
     pub sysinfo: HashMap<String, (u32, u64)>,
+    pub sysinfo_ts: HashMap<String, std::time::Instant>,
 }
+
+pub const SYSINFO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const FALLBACK_CORES: u32 = 1;
+pub const FALLBACK_MEM: u64 = 16 << 30;
 
 impl Caches {
     /// Remove entradas cujos ids sumiram no último ciclo.
@@ -187,7 +192,10 @@ impl DockerProvider for CliProvider {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let (cores, mem) = self.system_info().await.unwrap_or((1, 16 << 30));
+        let (cores, mem) = self
+            .system_info()
+            .await
+            .unwrap_or((FALLBACK_CORES, FALLBACK_MEM));
         let fmt = "{{.Id}}\t{{.HostConfig.NanoCpus}}\t{{.HostConfig.CpuQuota}}\t{{.HostConfig.CpuPeriod}}\t{{.HostConfig.CpusetCpus}}\t{{.HostConfig.Memory}}";
         let mut args: Vec<String> = vec![
             "--context".into(),
@@ -271,23 +279,44 @@ impl DockerProvider for CliProvider {
 
 pub struct BollardProvider {
     context: String,
+    #[allow(dead_code)]
     socket: String,
+    docker: bollard::Docker,
     info_timeout: Duration,
+    stats_timeout: Duration,
+    inspect_timeout: Duration,
 }
 
 impl BollardProvider {
     pub fn new(context: String, socket: String, info_timeout: Duration) -> Self {
+        Self::new_full(context, socket, info_timeout, info_timeout, info_timeout)
+    }
+
+    pub fn new_full(
+        context: String,
+        socket: String,
+        info_timeout: Duration,
+        stats_timeout: Duration,
+        inspect_timeout: Duration,
+    ) -> Self {
+        let path = socket
+            .strip_prefix("unix://")
+            .unwrap_or(&socket)
+            .to_string();
+        let docker = bollard::Docker::connect_with_socket(&path, 10, bollard::API_DEFAULT_VERSION)
+            .expect("bollard connect unix socket");
         Self {
             context,
             socket,
+            docker,
             info_timeout,
+            stats_timeout,
+            inspect_timeout,
         }
     }
 
     fn connect(&self) -> anyhow::Result<bollard::Docker> {
-        let path = self.socket.strip_prefix("unix://").unwrap_or(&self.socket);
-        bollard::Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
-            .context("bollard connect unix socket")
+        Ok(self.docker.clone())
     }
 }
 
@@ -307,8 +336,8 @@ impl DockerProvider for BollardProvider {
             .await
             .map_err(|_| anyhow::anyhow!("timeout info {}", self.context))??;
         Ok((
-            info.ncpu.unwrap_or(1) as u32,
-            info.mem_total.unwrap_or(16 << 30) as u64,
+            info.ncpu.unwrap_or(FALLBACK_CORES as i64) as u32,
+            info.mem_total.unwrap_or(FALLBACK_MEM as i64) as u64,
         ))
     }
 
@@ -319,13 +348,14 @@ impl DockerProvider for BollardProvider {
         let containers = tokio::time::timeout(
             self.info_timeout,
             docker.list_containers(Some(
-                ListContainersOptionsBuilder::default().all(true).build(),
+                ListContainersOptionsBuilder::default().all(false).build(),
             )),
         )
         .await
         .map_err(|_| anyhow::anyhow!("timeout list {}", self.context))??;
-        let mut rows = Vec::new();
-        for c in containers {
+        // stats one-shot em paralelo (FuturesUnordered, limite 8) — evita N×timeout sequencial.
+        let mut set = futures_util::stream::FuturesUnordered::new();
+        for c in containers.into_iter().take(128) {
             let Some(id) = c.id else { continue };
             let name = c
                 .names
@@ -333,16 +363,23 @@ impl DockerProvider for BollardProvider {
                 .and_then(|n| n.first())
                 .map(|n| n.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| short_id(&id).to_string());
-            // one-shot stats (sem stream)
-            let opts = bollard::query_parameters::StatsOptionsBuilder::default()
-                .stream(false)
-                .one_shot(true)
-                .build();
-            let mut stream = docker.stats(&id, Some(opts));
-            let Ok(Some(Ok(s))) = tokio::time::timeout(self.info_timeout, stream.next()).await
-            else {
-                continue;
-            };
+            let d = docker.clone();
+            let t = self.stats_timeout;
+            set.push(async move {
+                let opts = bollard::query_parameters::StatsOptionsBuilder::default()
+                    .stream(false)
+                    .one_shot(true)
+                    .build();
+                let mut stream = d.stats(&id, Some(opts));
+                let Ok(Some(Ok(s))) = tokio::time::timeout(t, stream.next()).await else {
+                    return None;
+                };
+                Some((id, name, s))
+            });
+        }
+        let mut rows = Vec::new();
+        while let Some(item) = futures_util::StreamExt::next(&mut set).await {
+            let Some((id, name, s)) = item else { continue };
             let (cpu_perc, mem_used, mem_limit, net_rx, net_tx, blk_r, blk_w, pids) =
                 bollard_sample_to_numbers(&s);
             rows.push(RawStats {
@@ -391,15 +428,20 @@ impl DockerProvider for BollardProvider {
         ids: &[String],
     ) -> anyhow::Result<Vec<(String, ContainerLimits)>> {
         let docker = self.connect()?;
-        let (cores, mem) = self.system_info().await.unwrap_or((1, 16 << 30));
+        let (cores, mem) = self
+            .system_info()
+            .await
+            .unwrap_or((FALLBACK_CORES, FALLBACK_MEM));
         let mut out = Vec::new();
         for id in ids {
-            let Ok(info) = docker
-                .inspect_container(
-                    id,
-                    None::<bollard::query_parameters::InspectContainerOptions>,
-                )
+            let fut = docker.inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            );
+            let Ok(info) = tokio::time::timeout(self.inspect_timeout, fut)
                 .await
+                .map_err(|_| anyhow::anyhow!("timeout inspect {}", id))
+                .and_then(|r| r.map_err(|e| anyhow::anyhow!(e)))
             else {
                 continue;
             };

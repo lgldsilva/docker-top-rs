@@ -179,17 +179,37 @@ pub fn strip_ansi(s: &str) -> String {
 
 /// Formata bytes em unidade binária (GiB/MiB/KiB/B) — igual ao Python.
 pub fn format_bytes_human(val: f64, precision: usize) -> String {
-    const G: f64 = 1024.0 * 1024.0 * 1024.0;
-    const M: f64 = 1024.0 * 1024.0;
-    const K: f64 = 1024.0;
-    if val >= G {
-        format!("{:.*} GiB", precision, val / G)
-    } else if val >= M {
-        format!("{:.*} MiB", precision, val / M)
-    } else if val >= K {
-        format!("{:.*} KiB", precision, val / K)
+    format_bytes_human_fmt(val, precision, false)
+}
+
+/// Variante decimal (GB/MB/KB/B) quando `display.byte_format == "decimal"`.
+pub fn format_bytes_human_fmt(val: f64, precision: usize, decimal: bool) -> String {
+    if decimal {
+        const G: f64 = 1000.0 * 1000.0 * 1000.0;
+        const M: f64 = 1000.0 * 1000.0;
+        const K: f64 = 1000.0;
+        if val >= G {
+            format!("{:.*} GB", precision, val / G)
+        } else if val >= M {
+            format!("{:.*} MB", precision, val / M)
+        } else if val >= K {
+            format!("{:.*} KB", precision, val / K)
+        } else {
+            format!("{:.0} B", val.max(0.0))
+        }
     } else {
-        format!("{:.0} B", val.max(0.0))
+        const G: f64 = 1024.0 * 1024.0 * 1024.0;
+        const M: f64 = 1024.0 * 1024.0;
+        const K: f64 = 1024.0;
+        if val >= G {
+            format!("{:.*} GiB", precision, val / G)
+        } else if val >= M {
+            format!("{:.*} MiB", precision, val / M)
+        } else if val >= K {
+            format!("{:.*} KiB", precision, val / K)
+        } else {
+            format!("{:.0} B", val.max(0.0))
+        }
     }
 }
 
