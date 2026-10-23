@@ -8,6 +8,7 @@
 //! mais cache `SystemInfo` por contexto.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -81,7 +82,12 @@ pub trait DockerProvider: Send + Sync {
 pub struct Caches {
     pub limits: HashMap<(String, String), ContainerLimits>,
     pub sysinfo: HashMap<String, (u32, u64)>,
+    pub sysinfo_ts: HashMap<String, std::time::Instant>,
 }
+
+pub const SYSINFO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const FALLBACK_CORES: u32 = 1;
+pub const FALLBACK_MEM: u64 = 16 << 30;
 
 impl Caches {
     /// Remove entradas cujos ids sumiram no último ciclo.
@@ -99,6 +105,7 @@ pub type SharedCaches = Arc<Mutex<Caches>>;
 
 pub struct CliProvider {
     context: String,
+    bin: PathBuf,
     stats_timeout: Duration,
     inspect_timeout: Duration,
     info_timeout: Duration,
@@ -108,23 +115,28 @@ impl CliProvider {
     pub fn new(context: String, stats: Duration, inspect: Duration, info: Duration) -> Self {
         Self {
             context,
+            bin: PathBuf::from("docker"),
             stats_timeout: stats,
             inspect_timeout: inspect,
             info_timeout: info,
         }
     }
 
+    /// Binário alternativo (testes com `docker` fake — sem PATH global).
+    pub fn with_bin(mut self, bin: PathBuf) -> Self {
+        self.bin = bin;
+        self
+    }
+
     async fn run_docker(&self, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-        let fut = tokio::process::Command::new("docker")
-            .args(args)
-            .output()
-            .await
-            .with_context(|| format!("spawn docker {}", args.join(" ")))?;
-        let out = tokio::time::timeout(timeout, async { Ok::<_, anyhow::Error>(fut) })
+        let mut cmd = tokio::process::Command::new(&self.bin);
+        cmd.args(args).kill_on_drop(true);
+        let out = tokio::time::timeout(timeout, cmd.output())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("timeout {}s: docker {}", timeout.as_secs(), args.join(" "))
-            })??;
+            })?
+            .with_context(|| format!("spawn {} {}", self.bin.display(), args.join(" ")))?;
         if !out.status.success() {
             anyhow::bail!(
                 "docker {} falhou: {}",
@@ -180,7 +192,10 @@ impl DockerProvider for CliProvider {
         if ids.is_empty() {
             return Ok(vec![]);
         }
-        let (cores, mem) = self.system_info().await.unwrap_or((1, 16 << 30));
+        let (cores, mem) = self
+            .system_info()
+            .await
+            .unwrap_or((FALLBACK_CORES, FALLBACK_MEM));
         let fmt = "{{.Id}}\t{{.HostConfig.NanoCpus}}\t{{.HostConfig.CpuQuota}}\t{{.HostConfig.CpuPeriod}}\t{{.HostConfig.CpusetCpus}}\t{{.HostConfig.Memory}}";
         let mut args: Vec<String> = vec![
             "--context".into(),
@@ -207,9 +222,7 @@ impl DockerProvider for CliProvider {
                     ];
                     if let Ok(s) = self.run_docker(&one, self.inspect_timeout).await {
                         acc.push_str(&s);
-                        if !s.ends_with('\n') {
-                            acc.push('\n');
-                        }
+                        acc.push('\n');
                     }
                 }
                 acc
@@ -264,23 +277,47 @@ impl DockerProvider for CliProvider {
 
 pub struct BollardProvider {
     context: String,
+    #[allow(dead_code)]
     socket: String,
+    docker: Option<bollard::Docker>,
     info_timeout: Duration,
+    stats_timeout: Duration,
+    inspect_timeout: Duration,
 }
 
 impl BollardProvider {
     pub fn new(context: String, socket: String, info_timeout: Duration) -> Self {
+        Self::new_full(context, socket, info_timeout, info_timeout, info_timeout)
+    }
+
+    pub fn new_full(
+        context: String,
+        socket: String,
+        info_timeout: Duration,
+        stats_timeout: Duration,
+        inspect_timeout: Duration,
+    ) -> Self {
+        let path = socket
+            .strip_prefix("unix://")
+            .unwrap_or(&socket)
+            .to_string();
+        // Sem panic: sem socket (ex. Mac sem Docker Desktop) vira erro tratável no collect.
+        let docker =
+            bollard::Docker::connect_with_socket(&path, 10, bollard::API_DEFAULT_VERSION).ok();
         Self {
             context,
             socket,
+            docker,
             info_timeout,
+            stats_timeout,
+            inspect_timeout,
         }
     }
 
     fn connect(&self) -> anyhow::Result<bollard::Docker> {
-        let path = self.socket.strip_prefix("unix://").unwrap_or(&self.socket);
-        bollard::Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)
-            .context("bollard connect unix socket")
+        self.docker
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("sem socket docker em {}", self.socket))
     }
 }
 
@@ -300,8 +337,8 @@ impl DockerProvider for BollardProvider {
             .await
             .map_err(|_| anyhow::anyhow!("timeout info {}", self.context))??;
         Ok((
-            info.ncpu.unwrap_or(1) as u32,
-            info.mem_total.unwrap_or(16 << 30) as u64,
+            info.ncpu.unwrap_or(FALLBACK_CORES as i64) as u32,
+            info.mem_total.unwrap_or(FALLBACK_MEM as i64) as u64,
         ))
     }
 
@@ -312,13 +349,14 @@ impl DockerProvider for BollardProvider {
         let containers = tokio::time::timeout(
             self.info_timeout,
             docker.list_containers(Some(
-                ListContainersOptionsBuilder::default().all(true).build(),
+                ListContainersOptionsBuilder::default().all(false).build(),
             )),
         )
         .await
         .map_err(|_| anyhow::anyhow!("timeout list {}", self.context))??;
-        let mut rows = Vec::new();
-        for c in containers {
+        // stats one-shot em paralelo (FuturesUnordered, limite 8) — evita N×timeout sequencial.
+        let mut set = futures_util::stream::FuturesUnordered::new();
+        for c in containers.into_iter().take(128) {
             let Some(id) = c.id else { continue };
             let name = c
                 .names
@@ -326,16 +364,23 @@ impl DockerProvider for BollardProvider {
                 .and_then(|n| n.first())
                 .map(|n| n.trim_start_matches('/').to_string())
                 .unwrap_or_else(|| short_id(&id).to_string());
-            // one-shot stats (sem stream)
-            let opts = bollard::query_parameters::StatsOptionsBuilder::default()
-                .stream(false)
-                .one_shot(true)
-                .build();
-            let mut stream = docker.stats(&id, Some(opts));
-            let Ok(Some(Ok(s))) = tokio::time::timeout(self.info_timeout, stream.next()).await
-            else {
-                continue;
-            };
+            let d = docker.clone();
+            let t = self.stats_timeout;
+            set.push(async move {
+                let opts = bollard::query_parameters::StatsOptionsBuilder::default()
+                    .stream(false)
+                    .one_shot(true)
+                    .build();
+                let mut stream = d.stats(&id, Some(opts));
+                let Ok(Some(Ok(s))) = tokio::time::timeout(t, stream.next()).await else {
+                    return None;
+                };
+                Some((id, name, s))
+            });
+        }
+        let mut rows = Vec::new();
+        while let Some(item) = futures_util::StreamExt::next(&mut set).await {
+            let Some((id, name, s)) = item else { continue };
             let (cpu_perc, mem_used, mem_limit, net_rx, net_tx, blk_r, blk_w, pids) =
                 bollard_sample_to_numbers(&s);
             rows.push(RawStats {
@@ -384,15 +429,20 @@ impl DockerProvider for BollardProvider {
         ids: &[String],
     ) -> anyhow::Result<Vec<(String, ContainerLimits)>> {
         let docker = self.connect()?;
-        let (cores, mem) = self.system_info().await.unwrap_or((1, 16 << 30));
+        let (cores, mem) = self
+            .system_info()
+            .await
+            .unwrap_or((FALLBACK_CORES, FALLBACK_MEM));
         let mut out = Vec::new();
         for id in ids {
-            let Ok(info) = docker
-                .inspect_container(
-                    id,
-                    None::<bollard::query_parameters::InspectContainerOptions>,
-                )
+            let fut = docker.inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            );
+            let Ok(info) = tokio::time::timeout(self.inspect_timeout, fut)
                 .await
+                .map_err(|_| anyhow::anyhow!("timeout inspect {}", id))
+                .and_then(|r| r.map_err(|e| anyhow::anyhow!(e)))
             else {
                 continue;
             };
@@ -575,6 +625,61 @@ pub fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_FAKE_DOCKER_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// Escreve um `docker` fake executável e retorna seu caminho + dir p/ limpeza.
+    fn fake_docker_bin(tag: &str, script: &str) -> (PathBuf, PathBuf) {
+        let unique = NEXT_FAKE_DOCKER_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dtcli-{tag}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        let mut f = std::fs::File::create(&bin).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        (bin, dir)
+    }
+
+    async fn read_unix_http_request(stream: &mut tokio::net::UnixStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.expect("read HTTP request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    async fn write_unix_http_response(stream: &mut tokio::net::UnixStream, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("write HTTP response");
+    }
 
     #[test]
     fn cache_evict_missing() {
@@ -619,10 +724,508 @@ mod tests {
             "3MiB / 4MiB".into(),
             "7".into(),
         ]);
-        let m = MockProvider::new("default", vec![raw]);
+        let mut m = MockProvider::new("default", vec![raw]);
+        assert_eq!(m.context_name(), "default");
         assert_eq!(m.transport_label(), "mock");
         assert_eq!(m.list_stats().await.unwrap().len(), 1);
+        m.limits.insert(
+            "abcdef123456".into(),
+            ContainerLimits {
+                cpu_limit: 2.0,
+                has_cpu_limit: true,
+                mem_limit: 1_073_741_824.0,
+                has_mem_limit: true,
+            },
+        );
+        let limits = m.inspect_limits(&["abcdef123456".into()]).await.unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].1.cpu_limit, 2.0);
         let (c, mm) = m.system_info().await.unwrap();
         assert_eq!((c, mm), (4, 8 * 1024 * 1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn cli_provider_lists_stats_and_info_with_fake_docker() {
+        let script = "#!/bin/sh\nif printf '%s' \"$*\" | grep -q 'stats'; then printf 'abcdef123456\\tweb\\t5.0%%\\t100MiB / 1GiB\\t9.7%%\\t1MiB / 1MiB\\t1MiB / 1MiB\\t3\\n'; elif printf '%s' \"$*\" | grep -q 'inspect'; then printf 'abcdef1234567890\\t0\\t0\\t0\\t\\t536870912\\n'; elif printf '%s' \"$*\" | grep -q 'info'; then printf '4\\t8589934592\\n'; else exit 1; fi\n";
+        let (bin, dir) = fake_docker_bin("ok", script);
+        let p = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .with_bin(bin);
+        assert_eq!(p.context_name(), "default");
+        assert_eq!(p.transport_label(), "cli");
+        let rows = p.list_stats().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        let (cores, mem) = p.system_info().await.unwrap();
+        assert_eq!((cores, mem), (4, 8589934592));
+        let lim = p
+            .inspect_limits(&["abcdef123456".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(lim.len(), 1);
+        assert!((lim[0].1.mem_limit - 536870912.0).abs() < 1.0);
+        let empty = p.inspect_limits(&[]).await.unwrap();
+        assert!(empty.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_skips_blank_and_malformed_stats_rows() {
+        let script = "#!/bin/sh\nprintf '%s' \"$*\" | grep -q 'stats' && printf '\\nmalformed row\\n\\033[31mabcdef123456\\tweb\\t5.0%%\\t100MiB / 1GiB\\t9.7%%\\t1MiB / 1MiB\\t1MiB / 1MiB\\t3\\033[0m\\n'\n";
+        let (bin, dir) = fake_docker_bin("stats-filter", script);
+        let provider = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .with_bin(bin);
+
+        let rows = provider.list_stats().await.expect("list fake stats");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_info_error_propagates() {
+        let (bin, dir) = fake_docker_bin("fail", "#!/bin/sh\nexit 1\n");
+        let p = CliProvider::new(
+            "ctxdown".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .with_bin(bin);
+        assert!(p.system_info().await.is_err());
+        assert!(p.list_stats().await.is_err());
+        assert!(p
+            .inspect_limits(&["zzz".to_string()])
+            .await
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_tolerates_malformed_info_and_failed_fallback_inspects() {
+        let script = "#!/bin/sh\ncase \"$*\" in\n  *info*) printf 'invalid\\tinvalid\\n' ;;\n  *inspect*) echo simulated inspect failure >&2; exit 1 ;;\n  *) exit 2 ;;\nesac\n";
+        let (bin, dir) = fake_docker_bin("inspect-fallback-failures", script);
+        let provider = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .with_bin(bin);
+
+        let limits = provider
+            .inspect_limits(&["abcdef1234567890".into()])
+            .await
+            .expect("inspect failures are tolerated");
+
+        assert!(limits.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_inspect_falls_back_to_individual_ids() {
+        let first_id = "abcdef1234567890";
+        let second_id = "fedcba6543210987";
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"{first_id} {second_id}\"*) exit 1 ;;\n  *\"{first_id}\"*) printf '{first_id}\\t0\\t0\\t0\\t\\t268435456\\n' ;;\n  *\"{second_id}\"*) printf '{second_id}\\t0\\t0\\t0\\t\\t536870912\\n' ;;\n  *info*) printf '4\\t8589934592\\n' ;;\n  *) exit 2 ;;\nesac\n"
+        );
+        let (bin, dir) = fake_docker_bin("inspect-fallback", &script);
+        let provider = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )
+        .with_bin(bin);
+
+        let limits = provider
+            .inspect_limits(&[first_id.into(), second_id.into()])
+            .await
+            .expect("individual inspect fallback");
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].0, "abcdef123456");
+        assert_eq!(limits[1].0, "fedcba654321");
+        assert_eq!(limits[0].1.mem_limit, 268_435_456.0);
+        assert_eq!(limits[1].1.mem_limit, 536_870_912.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end Docker API stats + inspect through a fake Unix-socket Engine.
+    #[tokio::test]
+    async fn bollard_lists_stats_and_inspects_over_unix_socket() {
+        use tokio::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("dt-api-stats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("docker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let id = format!("abcdef123456{}", "0".repeat(52));
+        let server_id = id.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().await.expect("accept API connection");
+                let request = read_unix_http_request(&mut stream).await;
+                let first_line = request.lines().next().unwrap_or_default();
+                let body = if first_line.contains("/containers/json") {
+                    format!(r#"[{{"Id":"{server_id}","Names":["/web"]}}]"#)
+                } else if first_line.contains("/stats?") || first_line.contains("/stats ") {
+                    serde_json::json!({
+                        "cpu_stats": {
+                            "cpu_usage": {"total_usage": 150},
+                            "system_cpu_usage": 1000,
+                            "online_cpus": 3
+                        },
+                        "precpu_stats": {
+                            "cpu_usage": {"total_usage": 50},
+                            "system_cpu_usage": 400
+                        },
+                        "memory_stats": {"usage": 1048576, "limit": 4194304},
+                        "networks": {"eth0": {"rx_bytes": 512, "tx_bytes": 256}},
+                        "blkio_stats": {
+                            "io_service_bytes_recursive": [
+                                {"op": "read", "value": 4096},
+                                {"op": "write", "value": 2048}
+                            ]
+                        },
+                        "pids_stats": {"current": 9}
+                    })
+                    .to_string()
+                } else if first_line.contains("/info ") {
+                    r#"{"NCPU":4,"MemTotal":8589934592}"#.to_string()
+                } else if first_line.contains(&format!("/containers/{server_id}/json")) {
+                    serde_json::json!({
+                        "Id": server_id,
+                        "HostConfig": {
+                            "NanoCpus": 1000000000,
+                            "CpuQuota": 50000,
+                            "CpuPeriod": 100000,
+                            "Memory": 536870912
+                        }
+                    })
+                    .to_string()
+                } else {
+                    panic!("unexpected Docker API request: {first_line}");
+                };
+                write_unix_http_response(&mut stream, &body).await;
+            }
+        });
+
+        let provider = BollardProvider::new_full(
+            "desktop-linux".into(),
+            format!("unix://{}", socket.display()),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        );
+        assert_eq!(provider.context_name(), "desktop-linux");
+        assert_eq!(provider.transport_label(), "api");
+        let rows = provider.list_stats().await.expect("list stats");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert_eq!(rows[0].name, "web");
+        assert_eq!(rows[0].cpu, Some(50.0));
+        assert_eq!(rows[0].mem_used, Some(1_048_576.0));
+        assert_eq!(rows[0].net_rx, Some(512.0));
+        assert_eq!(rows[0].pids, Some(9));
+        assert_eq!(
+            provider.system_info().await.expect("system info"),
+            (4, 8_589_934_592)
+        );
+
+        let limits = provider
+            .inspect_limits(std::slice::from_ref(&id))
+            .await
+            .expect("inspect limits");
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].0, short_id(&id));
+        assert!(limits[0].1.has_mem_limit);
+        assert_eq!(limits[0].1.mem_limit, 536_870_912.0);
+        server.await.expect("mock Docker API server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end Unix-socket API test with a fake Docker Engine (macOS/Linux).
+    #[tokio::test]
+    async fn bollard_connects_to_macos_style_unix_socket() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("dt-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("docker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept API connection");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.expect("read API request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request_line = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                request_line.contains("/info "),
+                "unexpected request: {request_line}"
+            );
+
+            let body = r#"{"NCPU":8,"MemTotal":17179869184}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write API response");
+        });
+
+        let endpoint = format!("unix://{}", socket.display());
+        let provider = BollardProvider::new_full(
+            "desktop-linux".into(),
+            endpoint,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        );
+        assert_eq!(provider.transport_label(), "api");
+        assert_eq!(
+            provider.system_info().await.expect("mock Docker info"),
+            (8, 17_179_869_184)
+        );
+        server.await.expect("mock Docker server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bollard_system_info_defaults_missing_fields() {
+        use tokio::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("dt-api-info-defaults-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("docker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept API connection");
+            let request = read_unix_http_request(&mut stream).await;
+            assert!(request
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("/info "));
+            write_unix_http_response(&mut stream, "{}").await;
+        });
+
+        let provider = BollardProvider::new(
+            "defaults".into(),
+            format!("unix://{}", socket.display()),
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(
+            provider.system_info().await.expect("empty info response"),
+            (FALLBACK_CORES, FALLBACK_MEM)
+        );
+        server.await.expect("mock Docker API server");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Smoke-test available local Unix sockets; an engine with zero containers is valid.
+    #[tokio::test]
+    async fn bollard_live_daemon_if_available() {
+        let mut sockets = Vec::new();
+        if let Ok(host) = std::env::var("DOCKER_HOST") {
+            if let Some(path) = host.strip_prefix("unix://") {
+                sockets.push(std::path::PathBuf::from(path));
+            }
+        }
+        sockets.push(std::path::PathBuf::from("/var/run/docker.sock"));
+        if let Some(home) = dirs::home_dir() {
+            sockets.push(home.join(".docker/run/docker.sock"));
+            sockets.push(home.join(".orbstack/run/docker.sock"));
+        }
+
+        let mut tested = std::collections::HashSet::new();
+        for socket in sockets {
+            let Ok(path) = std::fs::canonicalize(&socket) else {
+                continue;
+            };
+            let path = path.to_string_lossy().into_owned();
+            if !tested.insert(path.clone()) {
+                continue;
+            }
+            let endpoint = format!("unix://{path}");
+            let provider =
+                BollardProvider::new("local-smoke".into(), endpoint, Duration::from_secs(10));
+            let (cores, mem) = provider.system_info().await.expect("daemon info");
+            assert!(cores >= 1 && mem > 0);
+            let rows = provider.list_stats().await.expect("daemon stats");
+            let ids: Vec<String> = rows.iter().take(2).map(|row| row.id.clone()).collect();
+            provider.inspect_limits(&ids).await.expect("daemon inspect");
+        }
+        if tested.is_empty() {
+            eprintln!("pulando teste Bollard live: nenhum socket Docker Unix local");
+        }
+    }
+
+    #[test]
+    fn bollard_stats_convert_cpu_memory_network_block_io_and_pids() {
+        let stats: bollard::models::ContainerStatsResponse =
+            serde_json::from_value(serde_json::json!({
+                "cpu_stats": {
+                    "cpu_usage": {"total_usage": 150},
+                    "system_cpu_usage": 1000,
+                    "online_cpus": 3
+                },
+                "precpu_stats": {
+                    "cpu_usage": {"total_usage": 50},
+                    "system_cpu_usage": 400
+                },
+                "memory_stats": {"usage": 1048576, "limit": 4194304},
+                "networks": {
+                    "eth0": {"rx_bytes": 512, "tx_bytes": 256},
+                    "eth1": {"rx_bytes": 128, "tx_bytes": 64}
+                },
+                "blkio_stats": {
+                    "io_service_bytes_recursive": [
+                        {"op": "read", "value": 4096},
+                        {"op": "write", "value": 2048},
+                        {"op": "discard", "value": 1024}
+                    ]
+                },
+                "pids_stats": {"current": 9}
+            }))
+            .expect("valid Docker stats fixture");
+
+        let (cpu, used, limit, rx, tx, read, write, pids) = bollard_sample_to_numbers(&stats);
+        assert!((cpu - 50.0).abs() < 1e-9);
+        assert_eq!((used, limit), (1_048_576.0, 4_194_304.0));
+        assert_eq!((rx, tx), (640.0, 320.0));
+        assert_eq!((read, write, pids), (4096.0, 2048.0, 9));
+    }
+
+    #[test]
+    fn bollard_stats_saturate_counter_resets_and_default_missing_fields() {
+        let stats: bollard::models::ContainerStatsResponse =
+            serde_json::from_value(serde_json::json!({
+                "cpu_stats": {
+                    "cpu_usage": {"total_usage": 10},
+                    "system_cpu_usage": 100
+                },
+                "precpu_stats": {
+                    "cpu_usage": {"total_usage": 20},
+                    "system_cpu_usage": 100
+                }
+            }))
+            .expect("valid partial Docker stats fixture");
+
+        assert_eq!(
+            bollard_sample_to_numbers(&stats),
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0)
+        );
+    }
+
+    #[test]
+    fn build_snapshot_prefers_bollard_numbers_and_evicts() {
+        let caches = Caches::default();
+        let mut raw = RawStats::from_strings([
+            "abcdef123456".into(),
+            "web".into(),
+            "xx".into(),
+            "yy".into(),
+            "zz".into(),
+            "aa".into(),
+            "bb".into(),
+            "cc".into(),
+        ]);
+        raw.cpu = Some(25.0);
+        raw.mem_used = Some(100.0 * 1024.0 * 1024.0);
+        raw.mem_limit_stats = Some(1024.0 * 1024.0 * 1024.0);
+        raw.net_rx = Some(10.0);
+        raw.net_tx = Some(20.0);
+        raw.block_read = Some(30.0);
+        raw.block_write = Some(40.0);
+        raw.pids = Some(9);
+        let s = build_snapshot(&raw, "default", "api", &caches, 4, 8 * 1024 * 1024 * 1024);
+        assert!((s.cpu - 25.0).abs() < 1e-9);
+        assert_eq!(s.pids, 9);
+        assert!((s.net_total() - 30.0).abs() < 1e-9);
+        assert!((s.block_total() - 70.0).abs() < 1e-9);
+        assert_eq!(s.mem_limit, 1024.0 * 1024.0 * 1024.0);
+        assert!(s.has_mem_limit);
+    }
+
+    #[test]
+    fn build_snapshot_preserves_cached_limit_and_does_not_infer_zero() {
+        let mut raw = RawStats::from_strings([
+            "abcdef123456".into(),
+            "web".into(),
+            "invalid".into(),
+            "invalid".into(),
+            "invalid".into(),
+            "invalid".into(),
+            "invalid".into(),
+            "invalid".into(),
+        ]);
+        raw.cpu = Some(1.0);
+        raw.mem_used = Some(100.0);
+        raw.mem_limit_stats = Some(1024.0 * 1024.0 * 1024.0);
+
+        let mut caches = Caches::default();
+        caches.limits.insert(
+            ("default".into(), "abcdef123456".into()),
+            ContainerLimits {
+                cpu_limit: 2.0,
+                has_cpu_limit: true,
+                mem_limit: 2.0 * 1024.0 * 1024.0 * 1024.0,
+                has_mem_limit: true,
+            },
+        );
+        let cached = build_snapshot(&raw, "default", "api", &caches, 4, 8 * 1024 * 1024 * 1024);
+        assert_eq!(cached.mem_limit, 2.0 * 1024.0 * 1024.0 * 1024.0);
+        assert!(cached.has_mem_limit);
+
+        let mut zero = raw;
+        zero.id = "123456789abc".into();
+        zero.mem_limit_stats = Some(0.0);
+        let uncached = build_snapshot(
+            &zero,
+            "default",
+            "api",
+            &Caches::default(),
+            4,
+            8 * 1024 * 1024 * 1024,
+        );
+        assert_eq!(uncached.mem_limit, (8_u64 * 1024 * 1024 * 1024) as f64);
+        assert!(!uncached.has_mem_limit);
+    }
+
+    #[test]
+    fn fallback_memory_is_sixteen_gibibytes() {
+        assert_eq!(FALLBACK_MEM, 16 * 1024 * 1024 * 1024);
     }
 }

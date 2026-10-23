@@ -179,17 +179,37 @@ pub fn strip_ansi(s: &str) -> String {
 
 /// Formata bytes em unidade binária (GiB/MiB/KiB/B) — igual ao Python.
 pub fn format_bytes_human(val: f64, precision: usize) -> String {
-    const G: f64 = 1024.0 * 1024.0 * 1024.0;
-    const M: f64 = 1024.0 * 1024.0;
-    const K: f64 = 1024.0;
-    if val >= G {
-        format!("{:.*} GiB", precision, val / G)
-    } else if val >= M {
-        format!("{:.*} MiB", precision, val / M)
-    } else if val >= K {
-        format!("{:.*} KiB", precision, val / K)
+    format_bytes_human_fmt(val, precision, false)
+}
+
+/// Variante decimal (GB/MB/KB/B) quando `display.byte_format == "decimal"`.
+pub fn format_bytes_human_fmt(val: f64, precision: usize, decimal: bool) -> String {
+    if decimal {
+        const G: f64 = 1000.0 * 1000.0 * 1000.0;
+        const M: f64 = 1000.0 * 1000.0;
+        const K: f64 = 1000.0;
+        if val >= G {
+            format!("{:.*} GB", precision, val / G)
+        } else if val >= M {
+            format!("{:.*} MB", precision, val / M)
+        } else if val >= K {
+            format!("{:.*} KB", precision, val / K)
+        } else {
+            format!("{:.0} B", val.max(0.0))
+        }
     } else {
-        format!("{:.0} B", val.max(0.0))
+        const G: f64 = 1024.0 * 1024.0 * 1024.0;
+        const M: f64 = 1024.0 * 1024.0;
+        const K: f64 = 1024.0;
+        if val >= G {
+            format!("{:.*} GiB", precision, val / G)
+        } else if val >= M {
+            format!("{:.*} MiB", precision, val / M)
+        } else if val >= K {
+            format!("{:.*} KiB", precision, val / K)
+        } else {
+            format!("{:.0} B", val.max(0.0))
+        }
     }
 }
 
@@ -272,5 +292,59 @@ mod tests {
         assert!(format_bytes_human(3.0 * 1024.0 * 1024.0, 2).contains("MiB"));
         assert!(format_bytes_human(2048.0, 2).contains("KiB"));
         assert!(format_bytes_human(10.0, 2).contains("B"));
+    }
+
+    #[test]
+    fn parses_supported_units_scientific_notation_and_tolerant_inputs() {
+        let cases = [
+            ("1B", 1.0),
+            ("1KiB", 1024.0),
+            ("1MiB", 1024.0_f64.powi(2)),
+            ("1GiB", 1024.0_f64.powi(3)),
+            ("1TiB", 1024.0_f64.powi(4)),
+            ("1k", 1_000.0),
+            ("1KB", 1_000.0),
+            ("1m", 1_000_000.0),
+            ("1MB", 1_000_000.0),
+            ("1g", 1_000_000_000.0),
+            ("1GB", 1_000_000_000.0),
+            ("1t", 1_000_000_000_000.0),
+            ("1TB", 1_000_000_000_000.0),
+            ("1e3B", 1_000.0),
+            ("1.5 GiB", 1.5 * 1024.0_f64.powi(3)),
+            ("1unknown", 1.0),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(parse_bytes(input), expected, "{input}");
+        }
+        assert_eq!(parse_bytes("-0.0B"), 0.0);
+        assert_eq!(parse_bytes("1.2.3KB"), 0.0);
+        assert_eq!(parse_double_bytes("8KiB"), (8192.0, 0.0));
+        assert_eq!(parse_percent(" -2.5% "), -2.5);
+    }
+
+    #[test]
+    fn cpuset_invalid_ranges_and_empty_segments_are_counted_safely() {
+        assert_eq!(parse_cpuset_count("0-2,,4-3,7-,5", 8), 6);
+        assert_eq!(parse_cpuset_count(" , , ", 8), 8);
+        assert_eq!(parse_cpuset_count(" 1 - 3 ", 8), 3);
+    }
+
+    #[test]
+    fn malformed_ansi_sequences_do_not_panic() {
+        assert_eq!(strip_ansi("\x1bXplain"), "\x1bXplain");
+        assert_eq!(strip_ansi("\x1b["), "");
+        assert_eq!(strip_ansi("\x1b[31"), "");
+        assert_eq!(strip_ansi("\x1b[31mplain"), "plain");
+    }
+
+    #[test]
+    fn decimal_byte_format_uses_all_threshold_bands() {
+        assert_eq!(format_bytes_human_fmt(-1.0, 2, true), "0 B");
+        assert_eq!(format_bytes_human_fmt(999.0, 2, true), "999 B");
+        assert!(format_bytes_human_fmt(1_000.0, 2, true).contains("KB"));
+        assert!(format_bytes_human_fmt(1_000_000.0, 2, true).contains("MB"));
+        assert!(format_bytes_human_fmt(1_000_000_000.0, 2, true).contains("GB"));
+        assert_eq!(format_bytes_human_fmt(0.0, 0, false), "0 B");
     }
 }

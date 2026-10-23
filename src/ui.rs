@@ -13,7 +13,7 @@ use ratatui::Frame;
 
 use crate::config::AppConfig;
 use crate::model::{normalize_sort, sort_snapshots, visible_columns, ContainerSnapshot};
-use crate::parsers::format_bytes_human;
+use crate::parsers::format_bytes_human_fmt;
 use crate::transport::DockerContext;
 
 #[derive(Debug, Clone)]
@@ -91,6 +91,7 @@ pub fn summary_text(state: &AppState, cfg: &AppConfig) -> String {
         )
     });
     let p = cfg.display.precision;
+    let dec = cfg.display.byte_format == "decimal";
     let badges: Vec<String> = state
         .contexts
         .iter()
@@ -109,12 +110,12 @@ pub fn summary_text(state: &AppState, cfg: &AppConfig) -> String {
         filtered,
         tot_cpu,
         state.total_cores * 100,
-        format_bytes_human(tot_mem, p),
-        format_bytes_human(state.total_mem as f64, p),
-        format_bytes_human(rx, p),
-        format_bytes_human(tx, p),
-        format_bytes_human(br, p),
-        format_bytes_human(bw, p),
+        format_bytes_human_fmt(tot_mem, p, dec),
+        format_bytes_human_fmt(state.total_mem as f64, p, dec),
+        format_bytes_human_fmt(rx, p, dec),
+        format_bytes_human_fmt(tx, p, dec),
+        format_bytes_human_fmt(br, p, dec),
+        format_bytes_human_fmt(bw, p, dec),
         cfg.refresh_delay,
         badge_str,
     )
@@ -216,15 +217,16 @@ fn row_cells(
     narrow: bool,
 ) -> Vec<Cell<'static>> {
     let p = cfg.display.precision;
+    let dec = cfg.display.byte_format == "decimal";
     let cpu_lim = if s.has_cpu_limit {
         format!("{:.2}c", s.cpu_limit)
     } else {
         format!("{:.1}c (H)", s.cpu_limit)
     };
     let mem_lim = if s.has_mem_limit {
-        format_bytes_human(s.mem_limit, p)
+        format_bytes_human_fmt(s.mem_limit, p, dec)
     } else {
-        format!("{} (H)", format_bytes_human(s.mem_limit, p))
+        format!("{} (H)", format_bytes_human_fmt(s.mem_limit, p, dec))
     };
     let mut out = Vec::new();
     for c in cols {
@@ -235,17 +237,17 @@ fn row_cells(
             "cpu_rel" => format!("{:.1}%", s.cpu_rel),
             "mem_rel" => format!("{:.1}%", s.mem_rel),
             "cpu" => s.raw_cpu.clone(),
-            "mem_used" => format_bytes_human(s.mem_used, p),
+            "mem_used" => format_bytes_human_fmt(s.mem_used, p, dec),
             "cpu_lim" => cpu_lim.clone(),
             "mem_lim" => mem_lim.clone(),
-            "net_rx" => format_bytes_human(s.net_rx, p),
-            "net_tx" => format_bytes_human(s.net_tx, p),
+            "net_rx" => format_bytes_human_fmt(s.net_rx, p, dec),
+            "net_tx" => format_bytes_human_fmt(s.net_tx, p, dec),
             // Modos estreitos: total único em vez de "rx / tx" (não cabe).
-            "net" if narrow => format_bytes_human(s.net_total(), p),
+            "net" if narrow => format_bytes_human_fmt(s.net_total(), p, dec),
             "net" => s.raw_net.clone(),
-            "block_read" => format_bytes_human(s.block_read, p),
-            "block_write" => format_bytes_human(s.block_write, p),
-            "block" if narrow => format_bytes_human(s.block_total(), p),
+            "block_read" => format_bytes_human_fmt(s.block_read, p, dec),
+            "block_write" => format_bytes_human_fmt(s.block_write, p, dec),
+            "block" if narrow => format_bytes_human_fmt(s.block_total(), p, dec),
             "block" => s.raw_block.clone(),
             "pids" => s.pids.to_string(),
             _ => String::new(),
@@ -253,6 +255,15 @@ fn row_cells(
         let style = match c.as_str() {
             "cpu_rel" => cell_style_rel(s.cpu_rel, cfg),
             "mem_rel" => cell_style_rel(s.mem_rel, cfg),
+            "cpu" => {
+                if s.cpu >= cfg.thresholds.crit {
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                } else if s.cpu >= cfg.thresholds.cpu_abs_warn {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }
+            }
             _ => Style::default(),
         };
         out.push(Cell::from(txt).style(style));
@@ -332,20 +343,39 @@ pub fn render(frame: &mut Frame, state: &AppState, cfg: &AppConfig) {
     frame.render_widget(footer, chunks[2]);
 }
 
-/// Relógio `HH:MM:SS` sem nova dependência (respeita `clock_format` básico).
+/// Relógio sem nova dependência (respeita `clock_format` com %H %M %S %Y %m %d).
 fn chrono_like_now(fmt: &str) -> String {
-    // Usa /proc/uptime? Não — usa SystemTime e formata HH:MM:SS local via libc? Simplifica: UTC via UNIX epoch.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Converte p/ hora local aproximada lendo /etc/localtime? Evita dependência:
-    // usa `date +%H:%M:%S`? Não — calcula UTC e declara. Suficiente p/ header.
+    // UTC base; suficiente p/ header sem chrono. Dias simplificados (1970-01-01 + secs).
     let h = (secs / 3600) % 24;
     let m = (secs / 60) % 60;
     let s = secs % 60;
-    let _ = fmt;
-    format!("{h:02}:{m:02}:{s:02}")
+    let days = secs / 86400;
+    // aproximação civil p/ %Y-%m-%d (algoritmo dias -> data)
+    let (y, mo, d) = days_to_ymd(days);
+    fmt.replace("%H", &format!("{h:02}"))
+        .replace("%M", &format!("{m:02}"))
+        .replace("%S", &format!("{s:02}"))
+        .replace("%Y", &format!("{y:04}"))
+        .replace("%m", &format!("{mo:02}"))
+        .replace("%d", &format!("{d:02}"))
+}
+
+fn days_to_ymd(days: u64) -> (i32, u32, u32) {
+    // Howard Hinnant days_from_civil inverso, epoch 1970-01-01.
+    let z = days as i64 + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    ((if m <= 2 { y + 1 } else { y }) as i32, m, d)
 }
 
 /// `--once`: tabela texto (stdout, sem alt-screen). Schema estável p/ golden.
@@ -354,6 +384,15 @@ pub fn render_once_text(state: &AppState, cfg: &AppConfig, width: u16) -> String
     let sort = normalize_sort(&state.sort_by, &cols);
     let mut rows = state.visible_rows(cfg, width);
     sort_snapshots(&mut rows, &sort, state.desc);
+    // --once respeita reserved_rows: limita por altura real do terminal.
+    if let Ok((_, h)) = crossterm::terminal::size() {
+        let max = (h as usize)
+            .saturating_sub(cfg.layout.reserved_rows as usize + 2)
+            .max(1);
+        rows.truncate(max);
+    }
+    let p = cfg.display.precision;
+    let dec = cfg.display.byte_format == "decimal";
     let mut out = String::new();
     out.push_str(&format!("{}\n", summary_text(state, cfg)));
     out.push_str(&cols.join("\t"));
@@ -368,15 +407,15 @@ pub fn render_once_text(state: &AppState, cfg: &AppConfig, width: u16) -> String
                 "cpu_rel" => format!("{:.1}", s.cpu_rel),
                 "mem_rel" => format!("{:.1}", s.mem_rel),
                 "cpu" => format!("{:.2}", s.cpu),
-                "mem_used" => format!("{:.0}", s.mem_used),
+                "mem_used" => format_bytes_human_fmt(s.mem_used, p, dec),
                 "cpu_lim" => format!("{:.2}", s.cpu_limit),
-                "mem_lim" => format!("{:.0}", s.mem_limit),
-                "net_rx" => format!("{:.0}", s.net_rx),
-                "net_tx" => format!("{:.0}", s.net_tx),
-                "net" => format!("{:.0}", s.net_total()),
-                "block_read" => format!("{:.0}", s.block_read),
-                "block_write" => format!("{:.0}", s.block_write),
-                "block" => format!("{:.0}", s.block_total()),
+                "mem_lim" => format_bytes_human_fmt(s.mem_limit, p, dec),
+                "net_rx" => format_bytes_human_fmt(s.net_rx, p, dec),
+                "net_tx" => format_bytes_human_fmt(s.net_tx, p, dec),
+                "net" => format_bytes_human_fmt(s.net_total(), p, dec),
+                "block_read" => format_bytes_human_fmt(s.block_read, p, dec),
+                "block_write" => format_bytes_human_fmt(s.block_write, p, dec),
+                "block" => format_bytes_human_fmt(s.block_total(), p, dec),
                 "pids" => s.pids.to_string(),
                 _ => String::new(),
             })
@@ -464,5 +503,138 @@ mod tests {
         let s = summary_text(&state, &cfg);
         assert!(s.contains("default:api"));
         assert!(s.contains("homeserver:cli"));
+    }
+
+    #[test]
+    fn render_error_and_filter_edit_states() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (mut state, cfg) = sample_state();
+        state.errors = vec!["Timeout ao conectar ao contexto 'x'".to_string()];
+        state.editing_filter = true;
+        state.filter_draft = "we".to_string();
+        let backend = TestBackend::new(170, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+        let text = terminal.backend().to_string();
+        assert!(text.contains("editando"));
+    }
+
+    #[test]
+    fn effective_columns_hides_context_when_single() {
+        let (mut state, cfg) = sample_state();
+        state.selected_context = "default".to_string();
+        let cols = effective_columns(&state, &cfg, 200);
+        assert!(!cols.contains(&"context".to_string()));
+        let rows = state.visible_rows(&cfg, 200);
+        assert!(rows.iter().all(|r| r.context == "default"));
+    }
+
+    #[test]
+    fn summary_and_visible_rows_cover_empty_badge_and_filter_states() {
+        let (mut state, mut cfg) = sample_state();
+        state.filter = "WEB".into();
+        let rows = state.visible_rows(&cfg, 200);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        state.filter = "not-present".into();
+        assert!(state.visible_rows(&cfg, 200).is_empty());
+
+        cfg.display.show_transport_badge = false;
+        let text = summary_text(&state, &cfg);
+        assert!(!text.contains("default:api"));
+        state.contexts.clear();
+        assert!(!summary_text(&state, &cfg).contains(" ["));
+        cfg.display.show_transport_badge = true;
+        assert!(!summary_text(&state, &cfg).contains(" ["));
+    }
+
+    #[test]
+    fn summary_counts_idle_rows_and_keeps_zero_width_filter_valid() {
+        let (mut state, cfg) = sample_state();
+        state.rows.push(ContainerSnapshot::from_raw(
+            "ccc333333333".into(),
+            "idle".into(),
+            "0%".into(),
+            "0B / 1GiB".into(),
+            "0%".into(),
+            "0B / 0B".into(),
+            "0B / 0B".into(),
+            "0".into(),
+            "default".into(),
+            "api".into(),
+            None,
+            4,
+            8 * 1024 * 1024 * 1024,
+        ));
+        state.filter.clear();
+        assert_eq!(state.visible_rows(&cfg, 200).len(), 3);
+        let summary = summary_text(&state, &cfg);
+        assert!(summary.contains("3T 2A 3F"), "{summary}");
+    }
+
+    #[test]
+    fn civil_date_conversion_crosses_month_and_year_boundaries() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+        assert_eq!(days_to_ymd(11_017), (2000, 3, 1));
+        assert_eq!(days_to_ymd(11_231), (2000, 10, 1));
+        assert_eq!(days_to_ymd(11_322), (2000, 12, 31));
+    }
+
+    #[test]
+    fn cell_styles_and_headers_cover_threshold_and_sort_states() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cell_style_rel(cfg.thresholds.crit + 1.0, &cfg).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            cell_style_rel(cfg.thresholds.warn + 1.0, &cfg).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            cell_style_rel(cfg.thresholds.warn, &cfg).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(header_title("CPU", "cpu", "cpu", true), "CPU ▼");
+        assert_eq!(header_title("CPU", "cpu", "cpu", false), "CPU ▲");
+        assert_eq!(header_title("CPU", "cpu", "name", true), "CPU");
+        assert_eq!(short_title("unknown", 1), "UNKNOWN");
+        assert_eq!(short_title("unknown", 2), "UNKNOWN");
+    }
+
+    #[test]
+    fn row_cells_render_aggregates_and_unknown_columns_in_both_width_modes() {
+        let (state, cfg) = sample_state();
+        let cols = vec![
+            "net".to_string(),
+            "block".to_string(),
+            "unknown".to_string(),
+        ];
+        let narrow_cells = row_cells(&state.rows[0], &cols, &cfg, true);
+        let wide_cells = row_cells(&state.rows[0], &cols, &cfg, false);
+        assert_eq!(narrow_cells.len(), cols.len());
+        assert_eq!(wide_cells.len(), cols.len());
+    }
+
+    #[test]
+    fn all_context_mode_inserts_context_after_id_when_not_configured() {
+        let (mut state, mut cfg) = sample_state();
+        state.selected_context = "all".into();
+        cfg.columns.full = vec!["id".into(), "name".into()];
+
+        assert_eq!(
+            effective_columns(&state, &cfg, 200),
+            vec!["id", "context", "name"]
+        );
+    }
+
+    #[test]
+    fn all_context_columns_without_id_do_not_insert_a_context_column() {
+        let (mut state, mut cfg) = sample_state();
+        state.selected_context = "all".into();
+        cfg.columns.full = vec!["name".into()];
+        let cols = effective_columns(&state, &cfg, 200);
+        assert_eq!(cols, vec!["name".to_string()]);
     }
 }
