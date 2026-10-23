@@ -399,3 +399,573 @@ fn reload_cfg(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "docker-top-main-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn app_state() -> ui::AppState {
+        ui::AppState {
+            rows: vec![],
+            errors: vec![],
+            sort_by: "id".into(),
+            desc: true,
+            filter: "web".into(),
+            selected_context: "all".into(),
+            contexts: vec![
+                transport::DockerContext {
+                    name: "default".into(),
+                    endpoint: "unix:///var/run/docker.sock".into(),
+                    transport: transport::Transport::Api,
+                },
+                transport::DockerContext {
+                    name: "remote".into(),
+                    endpoint: "ssh://remote".into(),
+                    transport: transport::Transport::Cli,
+                },
+            ],
+            total_cores: 0,
+            total_mem: 0,
+            editing_filter: false,
+            filter_draft: String::new(),
+            clock_override: None,
+        }
+    }
+
+    fn test_cli() -> Cli {
+        Cli::try_parse_from(["docker-top-rs"]).expect("valid default CLI")
+    }
+
+    // NOSONAR: this test adapter forwards the complete handle_event fixture unchanged.
+    #[allow(clippy::too_many_arguments)]
+    fn send_key(
+        code: KeyCode,
+        modifiers: KeyModifiers,
+        state: &mut ui::AppState,
+        cfg: &mut AppConfig,
+        cli: &Cli,
+        config_path: &std::path::Path,
+        cfg_shared: &Arc<parking_lot_like::RwLock<AppConfig>>,
+        selected_shared: &Arc<Mutex<String>>,
+    ) -> anyhow::Result<bool> {
+        handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(code, modifiers)),
+            state,
+            cfg,
+            cli,
+            config_path,
+            cfg_shared,
+            selected_shared,
+        )
+    }
+
+    #[test]
+    fn handles_non_key_control_and_navigation_events() {
+        let cli = test_cli();
+        let mut cfg = AppConfig::default();
+        let path = temp_dir("events");
+        std::fs::write(&path, "").unwrap();
+        let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
+        let selected_shared = Arc::new(Mutex::new("all".into()));
+        let mut state = app_state();
+
+        assert!(!handle_event(
+            Event::Resize(80, 24),
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        assert!(!send_key(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        assert!(send_key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        assert!(!send_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        assert!(send_key(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn filter_edit_mode_handles_commit_cancel_backspace_character_and_other_keys() {
+        let cli = test_cli();
+        let mut cfg = AppConfig::default();
+        let path = temp_dir("filter");
+        std::fs::write(&path, "").unwrap();
+        let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
+        let selected_shared = Arc::new(Mutex::new("all".into()));
+        let mut state = app_state();
+        state.editing_filter = true;
+        state.filter_draft = "webx".into();
+
+        send_key(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.filter_draft, "web");
+        send_key(
+            KeyCode::Char('!'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.filter_draft, "web!");
+        send_key(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.filter_draft, "web!");
+        send_key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.filter, "web!");
+        assert!(!state.editing_filter);
+
+        state.editing_filter = true;
+        state.filter_draft = "discard".into();
+        send_key(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(state.filter_draft.is_empty());
+        assert!(!state.editing_filter);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn keybindings_cover_sort_toggle_filter_context_and_refresh_actions() {
+        let cli = test_cli();
+        let mut cfg = AppConfig::default();
+        let path = temp_dir("keybindings");
+        std::fs::write(&path, "").unwrap();
+        let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
+        let selected_shared = Arc::new(Mutex::new("all".into()));
+        let cases = [
+            (cfg.keybindings.sort_cpu_rel.clone(), "cpu_rel"),
+            (cfg.keybindings.sort_mem_rel.clone(), "mem_rel"),
+            (cfg.keybindings.sort_cpu.clone(), "cpu"),
+            (cfg.keybindings.sort_mem_used.clone(), "mem_used"),
+            (cfg.keybindings.sort_cpu_lim.clone(), "cpu_lim"),
+            (cfg.keybindings.sort_mem_lim.clone(), "mem_lim"),
+            (cfg.keybindings.sort_id.clone(), "id"),
+            (cfg.keybindings.sort_name.clone(), "name"),
+            (cfg.keybindings.sort_context.clone(), "context"),
+            (cfg.keybindings.sort_pids.clone(), "pids"),
+            (cfg.keybindings.sort_net_rx.clone(), "net_rx"),
+            (cfg.keybindings.sort_net_tx.clone(), "net_tx"),
+            (cfg.keybindings.sort_net.clone(), "net"),
+            (cfg.keybindings.sort_block_read.clone(), "block_read"),
+            (cfg.keybindings.sort_block_write.clone(), "block_write"),
+            (cfg.keybindings.sort_block.clone(), "block"),
+        ];
+        let mut state = app_state();
+        for (key, expected) in cases {
+            state.sort_by = "unknown".into();
+            send_key(
+                KeyCode::Char(key.chars().next().unwrap()),
+                KeyModifiers::NONE,
+                &mut state,
+                &mut cfg,
+                &cli,
+                &path,
+                &cfg_shared,
+                &selected_shared,
+            )
+            .unwrap();
+            assert_eq!(state.sort_by, expected, "key binding {key}");
+        }
+        cfg.keybindings.next_context = "z".into();
+        send_key(
+            KeyCode::Char('z'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.selected_context, "default");
+
+        let previous_order = state.desc;
+        send_key(
+            KeyCode::Char(cfg.keybindings.toggle_order.chars().next().unwrap()),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.desc, !previous_order);
+        send_key(
+            KeyCode::Char(cfg.keybindings.filter.chars().next().unwrap()),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(state.editing_filter);
+        assert_eq!(state.filter_draft, state.filter);
+        state.editing_filter = false;
+        state.desc = true;
+        cfg.refresh_delay = 9.9;
+        send_key(
+            KeyCode::Char('+'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(cfg.refresh_delay, 10.0);
+        cfg.refresh_delay = 0.6;
+        send_key(
+            KeyCode::Char('-'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(cfg.refresh_delay, 0.5);
+        send_key(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(send_key(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared
+        )
+        .unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tab_cycles_contexts_and_sort_arrows_wrap_columns() {
+        let cli = test_cli();
+        let mut cfg = AppConfig::default();
+        let path = temp_dir("navigation");
+        std::fs::write(&path, "").unwrap();
+        let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
+        let selected_shared = Arc::new(Mutex::new("all".into()));
+        let mut state = app_state();
+        state.rows.push(model::ContainerSnapshot::from_raw(
+            "id".into(),
+            "web".into(),
+            "0%".into(),
+            "0 / 0".into(),
+            "0%".into(),
+            "0 / 0".into(),
+            "0 / 0".into(),
+            "0".into(),
+            "default".into(),
+            "api".into(),
+            None,
+            1,
+            1,
+        ));
+        send_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.selected_context, "default");
+        assert_eq!(*selected_shared.lock().unwrap(), "default");
+        assert!(state.rows.is_empty());
+        send_key(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(state.selected_context, "remote");
+        state.selected_context = "missing".into();
+        cycle_context(&mut state, &selected_shared);
+        assert_eq!(state.selected_context, "default");
+        state.sort_by = "id".into();
+        send_key(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_ne!(state.sort_by, "id");
+        send_key(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(!state.sort_by.is_empty());
+        send_key(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(!state.desc);
+        send_key(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(state.desc);
+
+        cfg.columns.full.clear();
+        cfg.columns.compact.clear();
+        cfg.columns.ultra_compact.clear();
+        let previous_sort = state.sort_by.clone();
+        move_sort(&mut state, &cfg, 1);
+        assert_eq!(state.sort_by, previous_sort);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_updates_shared_config_and_records_invalid_config() {
+        let cli = test_cli();
+        let path = temp_dir("reload");
+        std::fs::write(&path, "sort = 'mem_rel'\nascending = true\n").unwrap();
+        let mut cfg = AppConfig::default();
+        let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
+        let selected_shared = Arc::new(Mutex::new("all".into()));
+        let mut state = app_state();
+
+        send_key(
+            KeyCode::Char('R'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert_eq!(cfg.sort, "mem_rel");
+        assert_eq!(state.sort_by, "mem_rel");
+        assert!(!state.desc);
+        assert_eq!(cfg_shared.read().sort, "mem_rel");
+
+        std::fs::write(&path, "unknown_field = 1\n").unwrap();
+        send_key(
+            KeyCode::Char('R'),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap();
+        assert!(state
+            .errors
+            .iter()
+            .any(|e| e.starts_with("reload config falhou:")));
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct TestProvider(String);
+
+    #[async_trait::async_trait]
+    impl DockerProvider for TestProvider {
+        fn context_name(&self) -> &str {
+            &self.0
+        }
+        fn transport_label(&self) -> &'static str {
+            "cli"
+        }
+        async fn list_stats(&self) -> anyhow::Result<Vec<provider::RawStats>> {
+            Ok(vec![provider::RawStats::from_strings([
+                "abcdef1234567890".into(),
+                "web".into(),
+                "1.0%".into(),
+                "1MiB / 1GiB".into(),
+                "0.1%".into(),
+                "1KiB / 2KiB".into(),
+                "1KiB / 2KiB".into(),
+                "1".into(),
+            ])])
+        }
+        async fn inspect_limits(
+            &self,
+            _ids: &[String],
+        ) -> anyhow::Result<Vec<(String, model::ContainerLimits)>> {
+            Ok(vec![])
+        }
+        async fn system_info(&self) -> anyhow::Result<(u32, u64)> {
+            Ok((2, 4 * 1024 * 1024 * 1024))
+        }
+    }
+
+    #[tokio::test]
+    async fn once_collects_all_or_only_the_selected_context() {
+        let cfg = AppConfig::default();
+        let providers: Vec<Arc<dyn DockerProvider>> = vec![
+            Arc::new(TestProvider("default".into())),
+            Arc::new(TestProvider("remote".into())),
+        ];
+        let discovered = transport::DiscoveredContexts {
+            contexts: vec![
+                transport::DockerContext {
+                    name: "default".into(),
+                    endpoint: "unix:///var/run/docker.sock".into(),
+                    transport: transport::Transport::Api,
+                },
+                transport::DockerContext {
+                    name: "remote".into(),
+                    endpoint: "ssh://remote".into(),
+                    transport: transport::Transport::Cli,
+                },
+            ],
+        };
+        for selected in ["all", "default", "missing"] {
+            run_once(&cfg, &providers, &discovered, selected)
+                .await
+                .unwrap();
+        }
+    }
+}

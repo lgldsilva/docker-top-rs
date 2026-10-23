@@ -371,11 +371,17 @@ mod tests {
         let cli = Cli {
             delay: Some(1.5),
             sort: Some("cpu_rel".to_string()),
+            asc: true,
+            filter: Some("web".to_string()),
+            context: Some("remote".to_string()),
             ..test_cli()
         };
         let cfg = AppConfig::load(&cli, &PathBuf::from("/nonexistent/x.toml")).unwrap();
         assert!((cfg.refresh_delay - 1.5).abs() < f64::EPSILON);
         assert_eq!(cfg.sort, "cpu_rel");
+        assert!(cfg.ascending);
+        assert_eq!(cfg.filter, "web");
+        assert_eq!(cfg.context, "remote");
     }
 
     #[test]

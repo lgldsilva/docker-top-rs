@@ -215,6 +215,30 @@ mod tests {
 
     struct FailingProvider(&'static str);
 
+    struct InfoFailProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl DockerProvider for InfoFailProvider {
+        fn context_name(&self) -> &str {
+            self.0
+        }
+        fn transport_label(&self) -> &'static str {
+            "cli"
+        }
+        async fn list_stats(&self) -> anyhow::Result<Vec<RawStats>> {
+            Ok(vec![raw("abcdeffedcba1234", "web")])
+        }
+        async fn inspect_limits(
+            &self,
+            _ids: &[String],
+        ) -> anyhow::Result<Vec<(String, crate::model::ContainerLimits)>> {
+            anyhow::bail!("inspect unavailable")
+        }
+        async fn system_info(&self) -> anyhow::Result<(u32, u64)> {
+            anyhow::bail!("info unavailable")
+        }
+    }
+
     #[async_trait::async_trait]
     impl DockerProvider for FailingProvider {
         fn context_name(&self) -> &str {
@@ -298,5 +322,100 @@ mod tests {
             .expect("canal");
         assert_eq!(out.rows.len(), 1);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn fresh_system_cache_skips_info_and_inspect_for_empty_context() {
+        let cfg = AppConfig::default();
+        let mut initial = Caches::default();
+        initial.sysinfo.insert("cached".into(), (6, 12_000));
+        initial
+            .sysinfo_ts
+            .insert("cached".into(), std::time::Instant::now());
+        let caches = Arc::new(Mutex::new(initial));
+        let provider: Arc<dyn DockerProvider> = Arc::new(MockProvider::new("cached", Vec::new()));
+
+        let out = collect_once(&[provider], &caches, &cfg).await;
+        assert!(out.rows.is_empty());
+        assert_eq!(out.totals_cores, 6);
+        assert_eq!(out.totals_mem, 12_000);
+    }
+
+    #[tokio::test]
+    async fn info_failure_without_cached_values_keeps_collection_available() {
+        let cfg = AppConfig::default();
+        let caches = Arc::new(Mutex::new(Caches::default()));
+        let provider: Arc<dyn DockerProvider> = Arc::new(InfoFailProvider("uncached"));
+
+        let out = collect_once(&[provider], &caches, &cfg).await;
+
+        assert_eq!(out.rows.len(), 1);
+        assert!(out.errors.is_empty());
+        assert_eq!((out.totals_cores, out.totals_mem), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn stale_system_cache_is_used_when_info_and_inspect_fail() {
+        let cfg = AppConfig::default();
+        let mut initial = Caches::default();
+        initial.sysinfo.insert("stale".into(), (3, 9_000));
+        initial.sysinfo_ts.insert(
+            "stale".into(),
+            std::time::Instant::now() - crate::provider::SYSINFO_TTL - Duration::from_secs(1),
+        );
+        let caches = Arc::new(Mutex::new(initial));
+        let provider: Arc<dyn DockerProvider> = Arc::new(InfoFailProvider("stale"));
+
+        let out = collect_once(&[provider], &caches, &cfg).await;
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.totals_cores, 3);
+        assert_eq!(out.totals_mem, 9_000);
+        assert!(out.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_filters_providers_by_selected_context() {
+        let cfg = AppConfig {
+            refresh_delay: 0.01,
+            ..AppConfig::default()
+        };
+        let shared = Arc::new(parking_lot_like::RwLock::new(cfg));
+        let caches = Arc::new(Mutex::new(Caches::default()));
+        let providers: Vec<Arc<dyn DockerProvider>> = vec![
+            Arc::new(MockProvider::new(
+                "default",
+                vec![raw("aaa111111111", "web")],
+            )),
+            Arc::new(MockProvider::new("remote", vec![raw("bbb222222222", "db")])),
+        ];
+        let (tx, mut rx) = mpsc::channel(1);
+        let selected = Arc::new(Mutex::new("default".to_string()));
+        let handle = spawn_collector(providers, caches, shared, selected, tx);
+        let out = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].context, "default");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_provider_set_and_closed_output_channel_terminate_cleanly() {
+        let cfg = AppConfig::default();
+        let caches = Arc::new(Mutex::new(Caches::default()));
+        let out = collect_once(&[], &caches, &cfg).await;
+        assert!(out.rows.is_empty());
+        assert!(out.errors.is_empty());
+
+        let shared = Arc::new(parking_lot_like::RwLock::new(cfg));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let selected = Arc::new(Mutex::new("no-context".to_string()));
+        let handle = spawn_collector(vec![], caches, shared, selected, tx);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("closed receiver should stop collector")
+            .expect("collector task should finish");
     }
 }

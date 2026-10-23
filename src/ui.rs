@@ -529,4 +529,112 @@ mod tests {
         let rows = state.visible_rows(&cfg, 200);
         assert!(rows.iter().all(|r| r.context == "default"));
     }
+
+    #[test]
+    fn summary_and_visible_rows_cover_empty_badge_and_filter_states() {
+        let (mut state, mut cfg) = sample_state();
+        state.filter = "WEB".into();
+        let rows = state.visible_rows(&cfg, 200);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        state.filter = "not-present".into();
+        assert!(state.visible_rows(&cfg, 200).is_empty());
+
+        cfg.display.show_transport_badge = false;
+        let text = summary_text(&state, &cfg);
+        assert!(!text.contains("default:api"));
+        state.contexts.clear();
+        assert!(!summary_text(&state, &cfg).contains(" ["));
+        cfg.display.show_transport_badge = true;
+        assert!(!summary_text(&state, &cfg).contains(" ["));
+    }
+
+    #[test]
+    fn summary_counts_idle_rows_and_keeps_zero_width_filter_valid() {
+        let (mut state, cfg) = sample_state();
+        state.rows.push(ContainerSnapshot::from_raw(
+            "ccc333333333".into(),
+            "idle".into(),
+            "0%".into(),
+            "0B / 1GiB".into(),
+            "0%".into(),
+            "0B / 0B".into(),
+            "0B / 0B".into(),
+            "0".into(),
+            "default".into(),
+            "api".into(),
+            None,
+            4,
+            8 * 1024 * 1024 * 1024,
+        ));
+        state.filter.clear();
+        assert_eq!(state.visible_rows(&cfg, 200).len(), 3);
+        let summary = summary_text(&state, &cfg);
+        assert!(summary.contains("3T 2A 3F"), "{summary}");
+    }
+
+    #[test]
+    fn civil_date_conversion_crosses_month_and_year_boundaries() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+        assert_eq!(days_to_ymd(11_017), (2000, 3, 1));
+        assert_eq!(days_to_ymd(11_231), (2000, 10, 1));
+        assert_eq!(days_to_ymd(11_322), (2000, 12, 31));
+    }
+
+    #[test]
+    fn cell_styles_and_headers_cover_threshold_and_sort_states() {
+        let cfg = AppConfig::default();
+        assert_eq!(
+            cell_style_rel(cfg.thresholds.crit + 1.0, &cfg).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(
+            cell_style_rel(cfg.thresholds.warn + 1.0, &cfg).fg,
+            Some(Color::Yellow)
+        );
+        assert_eq!(
+            cell_style_rel(cfg.thresholds.warn, &cfg).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(header_title("CPU", "cpu", "cpu", true), "CPU ▼");
+        assert_eq!(header_title("CPU", "cpu", "cpu", false), "CPU ▲");
+        assert_eq!(header_title("CPU", "cpu", "name", true), "CPU");
+        assert_eq!(short_title("unknown", 1), "UNKNOWN");
+        assert_eq!(short_title("unknown", 2), "UNKNOWN");
+    }
+
+    #[test]
+    fn row_cells_render_aggregates_and_unknown_columns_in_both_width_modes() {
+        let (state, cfg) = sample_state();
+        let cols = vec![
+            "net".to_string(),
+            "block".to_string(),
+            "unknown".to_string(),
+        ];
+        let narrow_cells = row_cells(&state.rows[0], &cols, &cfg, true);
+        let wide_cells = row_cells(&state.rows[0], &cols, &cfg, false);
+        assert_eq!(narrow_cells.len(), cols.len());
+        assert_eq!(wide_cells.len(), cols.len());
+    }
+
+    #[test]
+    fn all_context_mode_inserts_context_after_id_when_not_configured() {
+        let (mut state, mut cfg) = sample_state();
+        state.selected_context = "all".into();
+        cfg.columns.full = vec!["id".into(), "name".into()];
+
+        assert_eq!(
+            effective_columns(&state, &cfg, 200),
+            vec!["id", "context", "name"]
+        );
+    }
+
+    #[test]
+    fn all_context_columns_without_id_do_not_insert_a_context_column() {
+        let (mut state, mut cfg) = sample_state();
+        state.selected_context = "all".into();
+        cfg.columns.full = vec!["name".into()];
+        let cols = effective_columns(&state, &cfg, 200);
+        assert_eq!(cols, vec!["name".to_string()]);
+    }
 }

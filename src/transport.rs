@@ -240,19 +240,32 @@ mod tests {
     }
 
     #[test]
-    fn unix_goes_api_ssh_goes_cli() {
-        assert_eq!(
-            decide_transport("unix:///var/run/docker.sock"),
-            Transport::Api
-        );
-        assert_eq!(
-            decide_transport("ssh://lgldsilva@192.168.0.100"),
-            Transport::Cli
-        );
-        assert_eq!(
-            decide_transport("ssh://lgldsilva@10.228.143.11"),
-            Transport::Cli
-        );
+    fn macos_context_endpoints_dispatch_to_expected_transport() {
+        let cases = [
+            ("default", "unix:///var/run/docker.sock", Transport::Api),
+            (
+                "desktop-linux",
+                "unix:///Users/luizg/.docker/run/docker.sock",
+                Transport::Api,
+            ),
+            ("homeserver", "ssh://raspberrypi-srv", Transport::Cli),
+            ("oracle-aux", "ssh://oracle-aux", Transport::Cli),
+            ("oracle-desktop", "ssh://oracle-desktop", Transport::Cli),
+            ("oracle-home", "ssh://oracle-home", Transport::Cli),
+            (
+                "orbstack",
+                "unix:///Users/luizg/.orbstack/run/docker.sock",
+                Transport::Api,
+            ),
+        ];
+
+        for (context, endpoint, expected) in cases {
+            assert_eq!(
+                decide_transport(endpoint),
+                expected,
+                "wrong transport for context {context}"
+            );
+        }
         assert_eq!(decide_transport("tcp://x:2375"), Transport::Cli);
     }
 
@@ -260,6 +273,54 @@ mod tests {
     fn badge_labels() {
         assert_eq!(Transport::Api.badge(), "api");
         assert_eq!(Transport::Cli.badge(), "cli");
+    }
+
+    #[test]
+    fn discovered_contexts_expose_names_and_lookup() {
+        let discovered = DiscoveredContexts {
+            contexts: vec![
+                DockerContext {
+                    name: "default".into(),
+                    endpoint: "unix:///var/run/docker.sock".into(),
+                    transport: Transport::Api,
+                },
+                DockerContext {
+                    name: "homeserver".into(),
+                    endpoint: "ssh://raspberrypi-srv".into(),
+                    transport: Transport::Cli,
+                },
+            ],
+        };
+
+        assert_eq!(
+            discovered.names(),
+            vec!["default".to_string(), "homeserver".to_string()]
+        );
+        assert_eq!(
+            discovered
+                .get("homeserver")
+                .map(|context| context.endpoint.as_str()),
+            Some("ssh://raspberrypi-srv")
+        );
+        assert!(discovered.get("missing").is_none());
+    }
+
+    #[test]
+    fn docker_binary_resolution_never_returns_an_empty_path() {
+        let resolved = resolve_docker_bin();
+        assert!(!resolved.as_os_str().is_empty());
+        assert!(resolved.as_os_str() == "docker" || resolved.is_file());
+    }
+
+    #[test]
+    fn read_meta_endpoints_matches_existing_home_metadata() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+        let expected = read_meta_endpoints_from(&home.join(".docker/contexts/meta"));
+        if !expected.is_empty() {
+            assert_eq!(read_meta_endpoints(), expected);
+        }
     }
 
     #[test]
@@ -283,6 +344,13 @@ mod tests {
             r#"{"Name":"homeserver","Endpoints":{"docker":{"Host":"ssh://lgldsilva@192.168.0.100"}}}"#,
         );
         write_meta(&dir, "cccc", "not-json{{{");
+        write_meta(&dir, "eeee", r#"{"Name":"no-endpoints"}"#);
+        write_meta(&dir, "ffff", r#"{"Name":"no-docker","Endpoints":{}}"#);
+        write_meta(
+            &dir,
+            "gggg",
+            r#"{"Name":"no-host","Endpoints":{"docker":{}}}"#,
+        );
         std::fs::create_dir_all(dir.join("dddd")).unwrap(); // sem meta.json
         let map = read_meta_endpoints_from(&dir);
         assert_eq!(
@@ -354,6 +422,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discover_entrypoint_returns_contexts_or_default_fallback() {
+        let discovered = discover(Duration::from_secs(3)).await;
+        assert!(!discovered.contexts.is_empty());
+        assert!(!discovered.names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_context_ls_status_uses_default_fallback() {
+        let dir = std::env::temp_dir().join(format!("dtbin-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+printf 'ghost\n'
+echo simulated context failure >&2
+exit 42
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let discovered =
+            discover_with(&bin, &dir.join("missing-meta"), Duration::from_secs(2)).await;
+        assert_eq!(discovered.names(), vec!["default"]);
+        assert_eq!(
+            discovered.get("default").map(|context| context.transport),
+            Some(Transport::Api)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn discover_fallback_without_binary() {
         let d = discover_with(
             std::path::Path::new("/nonexistent-dt-docker"),
@@ -363,5 +469,44 @@ mod tests {
         .await;
         assert_eq!(d.contexts.len(), 1);
         assert_eq!(d.contexts[0].name, "default");
+    }
+
+    #[tokio::test]
+    async fn empty_context_listing_retries_then_falls_back() {
+        let dir = std::env::temp_dir().join(format!("dtbin-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        std::fs::write(&bin, "#!/bin/sh\nprintf '\\n  \\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let discovered =
+            discover_with(&bin, &dir.join("missing-meta"), Duration::from_secs(2)).await;
+        assert_eq!(discovered.names(), vec!["default"]);
+        assert_eq!(discovered.contexts[0].transport, Transport::Api);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn context_listing_timeout_falls_back_without_hanging() {
+        let dir = std::env::temp_dir().join(format!("dtbin-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 2\nprintf 'late\\n'\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let discovered =
+            discover_with(&bin, &dir.join("missing-meta"), Duration::from_millis(50)).await;
+        assert_eq!(discovered.names(), vec!["default"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

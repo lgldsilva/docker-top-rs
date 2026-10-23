@@ -422,4 +422,62 @@ mod tests {
         assert!(ultra.len() < compact.len() && compact.len() < full.len());
         assert!(!normalize_sort("pids", &[]).is_empty());
     }
+
+    #[test]
+    fn limit_selection_and_zero_denominators_use_safe_fallbacks() {
+        let quota_without_period = ContainerLimits::from_inspect(0, 100_000, 0, "", 0, 0, 0);
+        assert_eq!(quota_without_period.cpu_limit, 1.0);
+        assert!(!quota_without_period.has_cpu_limit);
+        assert_eq!(quota_without_period.mem_limit, 1.0);
+        assert!(!quota_without_period.has_mem_limit);
+
+        let cpu_from_cpuset = ContainerLimits::from_inspect(0, 0, 0, "0-1", 0, 8, 0);
+        assert_eq!(cpu_from_cpuset.cpu_limit, 2.0);
+        assert_eq!(cpu_from_cpuset.mem_limit, 1.0);
+        let quota_without_period = ContainerLimits::from_inspect(0, 200_000, 0, "", 0, 8, 1);
+        assert!(!quota_without_period.has_cpu_limit);
+        let period_without_quota = ContainerLimits::from_inspect(0, 0, 100_000, "", 0, 8, 1);
+        assert!(!period_without_quota.has_cpu_limit);
+
+        let fallback = ContainerLimits::fallback(0, 0, 0.0);
+        assert_eq!(fallback.cpu_limit, 0.0);
+        assert_eq!(fallback.mem_limit, 0.0);
+        assert!(!fallback.has_mem_limit);
+
+        let mut row = ContainerSnapshot::from_raw(
+            "id".into(),
+            "web".into(),
+            "10%".into(),
+            "100B / 0B".into(),
+            "25%".into(),
+            "0B / 0B".into(),
+            "0B / 0B".into(),
+            "0".into(),
+            "default".into(),
+            "api".into(),
+            Some(&fallback),
+            0,
+            0,
+        );
+        assert_eq!(row.cpu_rel, 0.0);
+        assert_eq!(row.mem_rel, 25.0);
+        row.apply_limits(&fallback);
+        assert_eq!(row.cpu_rel, 0.0);
+        assert_eq!(row.mem_rel, 25.0);
+    }
+
+    #[test]
+    fn sort_normalization_handles_visible_and_fallback_columns() {
+        let visible = vec!["id".to_string(), "net".to_string()];
+        assert_eq!(normalize_sort("id", &visible), "id");
+        assert_eq!(normalize_sort("net_tx", &visible), "net");
+        assert_eq!(normalize_sort("net_rx", &["id".into()]), "id");
+        assert_eq!(normalize_sort("block_read", &visible), "id");
+        assert_eq!(normalize_sort("block_write", &["block".into()]), "block");
+        assert_eq!(normalize_sort("anything", &[]), "cpu");
+        assert_eq!(normalize_sort("block", &["block".into()]), "block");
+        let mut rows = sample();
+        sort_snapshots(&mut rows, "unknown-column", false);
+        assert_eq!(rows[0].id, "aaa");
+    }
 }
