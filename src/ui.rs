@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::config::AppConfig;
+use crate::logging::days_to_ymd;
 use crate::model::{normalize_sort, sort_snapshots, visible_columns, ContainerSnapshot};
 use crate::parsers::format_bytes_human_fmt;
 use crate::transport::DockerContext;
@@ -19,7 +20,9 @@ use crate::transport::DockerContext;
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub rows: Vec<ContainerSnapshot>,
-    pub errors: Vec<String>,
+    /// Erros do último tick como `(contexto, mensagem)` — renderizados no
+    /// footer da TUI (antes eram engolidos: remoto fora parecia "vazio").
+    pub errors: Vec<(String, String)>,
     pub sort_by: String,
     pub desc: bool,
     pub filter: String,
@@ -92,10 +95,24 @@ pub fn summary_text(state: &AppState, cfg: &AppConfig) -> String {
     });
     let p = cfg.display.precision;
     let dec = cfg.display.byte_format == "decimal";
+    let errored: std::collections::HashSet<&str> =
+        state.errors.iter().map(|(c, _)| c.as_str()).collect();
     let badges: Vec<String> = state
         .contexts
         .iter()
-        .map(|c| format!("{}:{}", c.name, c.transport.badge()))
+        .map(|c| {
+            // `!` marca contexto com erro no último tick (visível também no --once)
+            format!(
+                "{}:{}{}",
+                c.name,
+                c.transport.badge(),
+                if errored.contains(c.name.as_str()) {
+                    "!"
+                } else {
+                    ""
+                }
+            )
+        })
         .collect();
     let badge_str = if cfg.display.show_transport_badge && !badges.is_empty() {
         format!(" [{}]", badges.join(" "))
@@ -273,12 +290,14 @@ fn row_cells(
 
 pub fn render(frame: &mut Frame, state: &AppState, cfg: &AppConfig) {
     let area = frame.area();
+    // footer cresce 1 linha quando há erros p/ exibi-los (antes: silêncio total)
+    let footer_h: u16 = if state.errors.is_empty() { 3 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
-            Constraint::Length(3),
+            Constraint::Length(footer_h),
         ])
         .split(area);
     let clock = state
@@ -338,23 +357,42 @@ pub fn render(frame: &mut Frame, state: &AppState, cfg: &AppConfig) {
     let footer_txt = format!(
         "filtro {filter_info} | Tab ctx | ←/→ col ↑/↓ ordem | R reload | +/- refresh | q sair"
     );
-    let footer = Paragraph::new(Line::from(vec![Span::raw(footer_txt)]))
-        .block(Block::default().borders(Borders::ALL).title("atalhos"));
+    let mut footer_lines = vec![Line::from(Span::raw(footer_txt))];
+    if !state.errors.is_empty() {
+        let joined = state
+            .errors
+            .iter()
+            .map(|(c, m)| {
+                if c.is_empty() {
+                    m.clone()
+                } else {
+                    format!("{c}: {m}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        footer_lines.push(Line::from(Span::styled(
+            format!("⚠ {joined}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    let footer =
+        Paragraph::new(footer_lines).block(Block::default().borders(Borders::ALL).title("atalhos"));
     frame.render_widget(footer, chunks[2]);
 }
 
 /// Relógio sem nova dependência (respeita `clock_format` com %H %M %S %Y %m %d).
+/// UTC base; suficiente p/ header sem chrono. Dias simplificados (1970-01-01 + secs).
 fn chrono_like_now(fmt: &str) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // UTC base; suficiente p/ header sem chrono. Dias simplificados (1970-01-01 + secs).
     let h = (secs / 3600) % 24;
     let m = (secs / 60) % 60;
     let s = secs % 60;
     let days = secs / 86400;
-    // aproximação civil p/ %Y-%m-%d (algoritmo dias -> data)
+    // aproximação civil p/ %Y-%m-%d (algoritmo dias -> data em logging::days_to_ymd)
     let (y, mo, d) = days_to_ymd(days);
     fmt.replace("%H", &format!("{h:02}"))
         .replace("%M", &format!("{m:02}"))
@@ -362,20 +400,6 @@ fn chrono_like_now(fmt: &str) -> String {
         .replace("%Y", &format!("{y:04}"))
         .replace("%m", &format!("{mo:02}"))
         .replace("%d", &format!("{d:02}"))
-}
-
-fn days_to_ymd(days: u64) -> (i32, u32, u32) {
-    // Howard Hinnant days_from_civil inverso, epoch 1970-01-01.
-    let z = days as i64 + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    ((if m <= 2 { y + 1 } else { y }) as i32, m, d)
 }
 
 /// `--once`: tabela texto (stdout, sem alt-screen). Schema estável p/ golden.
@@ -425,8 +449,12 @@ pub fn render_once_text(state: &AppState, cfg: &AppConfig, width: u16) -> String
     }
     if !state.errors.is_empty() {
         out.push_str("errors:\n");
-        for e in &state.errors {
-            out.push_str(&format!("  - {e}\n"));
+        for (c, m) in &state.errors {
+            if c.is_empty() {
+                out.push_str(&format!("  - {m}\n"));
+            } else {
+                out.push_str(&format!("  - {c}: {m}\n"));
+            }
         }
     }
     out
@@ -510,7 +538,10 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let (mut state, cfg) = sample_state();
-        state.errors = vec!["Timeout ao conectar ao contexto 'x'".to_string()];
+        state.errors = vec![(
+            "homeserver".to_string(),
+            "timeout 30s: ssh homeserver docker stats".to_string(),
+        )];
         state.editing_filter = true;
         state.filter_draft = "we".to_string();
         let backend = TestBackend::new(170, 30);
@@ -518,6 +549,34 @@ mod tests {
         terminal.draw(|f| render(f, &state, &cfg)).unwrap();
         let text = terminal.backend().to_string();
         assert!(text.contains("editando"));
+        // erro visível no footer (antes era engolido pela TUI)
+        assert!(text.contains("⚠ homeserver: timeout 30s"), "{text}");
+    }
+
+    #[test]
+    fn summary_badge_marks_errored_context_with_bang() {
+        let (mut state, cfg) = sample_state();
+        state.errors = vec![("homeserver".to_string(), "daemon down".to_string())];
+        let s = summary_text(&state, &cfg);
+        assert!(s.contains("homeserver:cli!"), "{s}");
+        assert!(s.contains("default:api "), "{s}");
+        state.errors.clear();
+        let s = summary_text(&state, &cfg);
+        assert!(s.contains("homeserver:cli]"), "{s}");
+        assert!(!s.contains("homeserver:cli!"), "{s}");
+    }
+
+    #[test]
+    fn once_text_lists_errors_per_context() {
+        let (mut state, cfg) = sample_state();
+        state.errors = vec![
+            ("homeserver".to_string(), "timeout".to_string()),
+            (String::new(), "join falhou".to_string()),
+        ];
+        let txt = render_once_text(&state, &cfg, 200);
+        assert!(txt.contains("errors:"));
+        assert!(txt.contains("  - homeserver: timeout"));
+        assert!(txt.contains("  - join falhou"));
     }
 
     #[test]
@@ -571,14 +630,6 @@ mod tests {
         assert_eq!(state.visible_rows(&cfg, 200).len(), 3);
         let summary = summary_text(&state, &cfg);
         assert!(summary.contains("3T 2A 3F"), "{summary}");
-    }
-
-    #[test]
-    fn civil_date_conversion_crosses_month_and_year_boundaries() {
-        assert_eq!(days_to_ymd(0), (1970, 1, 1));
-        assert_eq!(days_to_ymd(11_017), (2000, 3, 1));
-        assert_eq!(days_to_ymd(11_231), (2000, 10, 1));
-        assert_eq!(days_to_ymd(11_322), (2000, 12, 31));
     }
 
     #[test]

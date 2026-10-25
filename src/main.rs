@@ -3,8 +3,9 @@
 //! Startup: CLI → config (figment) → transport dispatch 1x → providers →
 //! `--once` (texto) ou TUI event-driven (coleta != render).
 
-use docker_top_rs::{cli, collector, config, model, provider, transport, ui};
+use docker_top_rs::{cli, collector, config, logging, model, provider, transport, ui};
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use tokio::sync::mpsc;
 use cli::Cli;
 use collector::{collect_once, parking_lot_like, CollectOutput};
 use config::{default_config_path, AppConfig};
-use provider::{Caches, CliProvider, DockerProvider};
+use provider::{Caches, DockerProvider};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,11 +42,52 @@ async fn main() -> anyhow::Result<()> {
         cfg.refresh_delay = d.clamp(0.5, 10.0);
     }
 
+    // Log em arquivo (opt-in): erros por contexto/tick + duração das coletas.
+    let logger = Arc::new(logging::Logger::open(cli.log.as_deref()));
+    logger.log(format!(
+        "start pid={} once={} ssh_direct={} ssh_hosts={}",
+        std::process::id(),
+        cli.once,
+        cfg.ssh_direct,
+        cfg.ssh_hosts
+    ));
+
     // Dispatch de transporte 1x no startup (sem flapping por request).
     let ls_timeout = Duration::from_secs_f64(cfg.timeouts.context_ls.max(0.5));
-    let discovered = transport::discover(ls_timeout).await;
+    let mut discovered = transport::discover(ls_timeout).await;
     if discovered.contexts.is_empty() {
         anyhow::bail!("nenhum contexto docker descoberto");
+    }
+    for c in &discovered.contexts {
+        logger.log(format!(
+            "discover ctx={} endpoint={} via={}",
+            c.name,
+            c.endpoint,
+            c.transport.badge()
+        ));
+    }
+
+    // Fonte extra de remotos: hosts de ~/.ssh/config com daemon Docker (opt-in).
+    // Esses não são docker contexts — só respondem via SSH direto.
+    let mut ssh_only_hosts: HashSet<String> = HashSet::new();
+    if cfg.ssh_hosts {
+        let candidates = transport::read_ssh_config_hosts();
+        let probe_t = Duration::from_secs_f64(cfg.timeouts.context_ls.max(3.0) * 2.0);
+        let extra = transport::discover_ssh_hosts(candidates, &discovered.names(), probe_t).await;
+        for c in &extra {
+            logger.log(format!(
+                "discover-ssh ctx={} endpoint={}",
+                c.name, c.endpoint
+            ));
+            ssh_only_hosts.insert(c.name.clone());
+        }
+        if !extra.is_empty() {
+            eprintln!(
+                "ssh-hosts: {} host(s) com daemon docker descobertos no ~/.ssh/config",
+                extra.len()
+            );
+            discovered.contexts.extend(extra);
+        }
     }
 
     let stats_t = Duration::from_secs_f64(cfg.timeouts.stats.max(1.0));
@@ -64,10 +106,24 @@ async fn main() -> anyhow::Result<()> {
                     stats_t,
                     inspect_t,
                 )),
-                transport::Transport::Cli => Arc::new(
-                    CliProvider::new(c.name.clone(), stats_t, inspect_t, info_t)
-                        .with_bin(docker_bin.clone()),
-                ),
+                transport::Transport::Cli => {
+                    // SSH direto: opt-in via --ssh-direct, ou obrigatório para
+                    // hosts descobertos no ~/.ssh/config (não são docker contexts).
+                    let (ssh_host, ssh_port) = if cfg.ssh_direct || ssh_only_hosts.contains(&c.name)
+                    {
+                        transport::ssh_dest_from_endpoint(&c.endpoint)
+                            .unwrap_or((String::new(), None))
+                    } else {
+                        (String::new(), None)
+                    };
+                    let ssh_host = (!ssh_host.is_empty()).then_some(ssh_host);
+                    Arc::new(
+                        provider::CliProvider::new(c.name.clone(), stats_t, inspect_t, info_t)
+                            .with_bin(docker_bin.clone())
+                            .with_ssh_host(ssh_host)
+                            .with_ssh_port(ssh_port),
+                    )
+                }
             }
         })
         .collect();
@@ -80,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cli.once {
-        return run_once(&cfg, &providers, &discovered, &initial_context).await;
+        return run_once(&cfg, &providers, &discovered, &initial_context, &logger).await;
     }
 
     run_tui(
@@ -90,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
         providers,
         discovered,
         initial_context,
+        logger,
     )
     .await
 }
@@ -99,6 +156,7 @@ async fn run_once(
     providers: &[Arc<dyn DockerProvider>],
     discovered: &transport::DiscoveredContexts,
     selected: &str,
+    logger: &logging::Logger,
 ) -> anyhow::Result<()> {
     // Igual ao Python: coleta só o contexto selecionado (all = todos).
     let active: Vec<Arc<dyn DockerProvider>> = providers
@@ -107,7 +165,7 @@ async fn run_once(
         .cloned()
         .collect();
     let caches = Arc::new(Mutex::new(Caches::default()));
-    let out = collect_once(&active, &caches, cfg).await;
+    let out = collect_once(&active, &caches, cfg, logger, true).await;
     let width = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(200);
     let state = ui::AppState {
         rows: out.rows,
@@ -136,6 +194,7 @@ async fn run_tui(
     providers: Vec<Arc<dyn DockerProvider>>,
     discovered: transport::DiscoveredContexts,
     initial_context: String,
+    logger: Arc<logging::Logger>,
 ) -> anyhow::Result<()> {
     let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
     let caches = Arc::new(Mutex::new(Caches::default()));
@@ -146,6 +205,7 @@ async fn run_tui(
         Arc::clone(&caches),
         Arc::clone(&cfg_shared),
         Arc::clone(&selected_shared),
+        Arc::clone(&logger),
         tx,
     );
 
@@ -395,7 +455,9 @@ fn reload_cfg(
             eprintln!("config recarregada de {}", path.display());
         }
         Err(e) => {
-            state.errors.push(format!("reload config falhou: {e:#}"));
+            state
+                .errors
+                .push(("config".to_string(), format!("reload config falhou: {e:#}")));
         }
     }
 }
@@ -904,7 +966,7 @@ mod tests {
         assert!(state
             .errors
             .iter()
-            .any(|e| e.starts_with("reload config falhou:")));
+            .any(|(c, m)| c == "config" && m.starts_with("reload config falhou:")));
         let _ = std::fs::remove_file(path);
     }
 
@@ -963,9 +1025,15 @@ mod tests {
             ],
         };
         for selected in ["all", "default", "missing"] {
-            run_once(&cfg, &providers, &discovered, selected)
-                .await
-                .unwrap();
+            run_once(
+                &cfg,
+                &providers,
+                &discovered,
+                selected,
+                &logging::Logger::disabled(),
+            )
+            .await
+            .unwrap();
         }
     }
 }

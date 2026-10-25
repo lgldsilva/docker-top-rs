@@ -7,11 +7,13 @@ sort = "cpu"
 ascending = false
 filter = ""
 context = "all"
+ssh_direct = false
+ssh_hosts = false
 
 [timeouts]
 context_ls = 3.0
 info = 3.0
-stats = 10.0
+stats = 30.0
 inspect = 30.0
 
 [thresholds]

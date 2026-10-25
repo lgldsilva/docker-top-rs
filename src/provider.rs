@@ -78,16 +78,22 @@ pub trait DockerProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// Cache `(ctx, short_id) -> limites` com evict; + `(cores, mem)` por contexto.
+/// `in_flight`: inspects em background (TUI) p/ não duplicar chamadas entre ticks.
 #[derive(Debug, Default)]
 pub struct Caches {
     pub limits: HashMap<(String, String), ContainerLimits>,
     pub sysinfo: HashMap<String, (u32, u64)>,
     pub sysinfo_ts: HashMap<String, std::time::Instant>,
+    pub in_flight: HashSet<(String, String)>,
 }
 
 pub const SYSINFO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub const FALLBACK_CORES: u32 = 1;
 pub const FALLBACK_MEM: u64 = 16 << 30;
+
+/// Tamanho da fatia de `inspect` em paralelo (CliProvider): lote único de
+/// ~57 ids via ssh mediu 25s+ em host lento (Pi); fatias dividem a latência.
+const INSPECT_CHUNK: usize = 12;
 
 impl Caches {
     /// Remove entradas cujos ids sumiram no último ciclo.
@@ -106,6 +112,16 @@ pub type SharedCaches = Arc<Mutex<Caches>>;
 pub struct CliProvider {
     context: String,
     bin: PathBuf,
+    /// Modo SSH direto (`--ssh-direct`): `ssh [user@]host docker ...` em vez de
+    /// `docker --context` (BatchMode/ConnectTimeout, sem depender de context).
+    ssh_host: Option<String>,
+    /// Porta ssh do modo direto (`ssh://user@host:port`).
+    ssh_port: Option<u16>,
+    /// Binário ssh do modo direto (fake nos testes).
+    ssh_bin: PathBuf,
+    /// Cache TTL de `system_info`: o collector e o `inspect_limits` pedem o
+    /// mesmo (cores, mem) no mesmo tick — sem cache seriam 2 chamadas ssh.
+    sysinfo_cache: tokio::sync::Mutex<Option<(std::time::Instant, (u32, u64))>>,
     stats_timeout: Duration,
     inspect_timeout: Duration,
     info_timeout: Duration,
@@ -116,6 +132,10 @@ impl CliProvider {
         Self {
             context,
             bin: PathBuf::from("docker"),
+            ssh_host: None,
+            ssh_port: None,
+            ssh_bin: PathBuf::from("ssh"),
+            sysinfo_cache: tokio::sync::Mutex::new(None),
             stats_timeout: stats,
             inspect_timeout: inspect,
             info_timeout: info,
@@ -128,19 +148,72 @@ impl CliProvider {
         self
     }
 
+    /// Habilita o modo SSH direto contra `[user@]host` (endpoint `ssh://`).
+    pub fn with_ssh_host(mut self, host: Option<String>) -> Self {
+        self.ssh_host = host;
+        self
+    }
+
+    /// Porta ssh do modo direto (endpoint `ssh://user@host:port`).
+    pub fn with_ssh_port(mut self, port: Option<u16>) -> Self {
+        self.ssh_port = port;
+        self
+    }
+
+    /// Binário ssh alternativo p/ o modo direto (testes com fake).
+    pub fn with_ssh_bin(mut self, bin: PathBuf) -> Self {
+        self.ssh_bin = bin;
+        self
+    }
+
+    /// Descrição do comando p/ mensagens de erro.
+    fn describe(&self, args: &[&str]) -> String {
+        let args = self.strip_local_context(args);
+        match &self.ssh_host {
+            Some(host) => format!("ssh {} docker {}", host, args.join(" ")),
+            None => format!("{} {}", self.bin.display(), args.join(" ")),
+        }
+    }
+
+    /// `--context X` é um conceito do docker LOCAL — no modo SSH direto o
+    /// comando roda no host remoto e não pode levar o par.
+    fn strip_local_context<'a>(&self, args: &'a [&'a str]) -> &'a [&'a str] {
+        if self.ssh_host.is_some() && args.len() >= 2 && args[0] == "--context" {
+            &args[2..]
+        } else {
+            args
+        }
+    }
+
     async fn run_docker(&self, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
-        let mut cmd = tokio::process::Command::new(&self.bin);
-        cmd.args(args).kill_on_drop(true);
+        let args = self.strip_local_context(args);
+        // No modo ssh os args docker vão DENTRO do comando remoto único
+        // (quotados); acrescentá-los de novo como argv do ssh os concatena ao
+        // comando e o shell remoto os trata como nomes de container.
+        let mut cmd = match &self.ssh_host {
+            Some(host) => {
+                let mut c = tokio::process::Command::new(&self.ssh_bin);
+                c.args(crate::transport::ssh_base_args(host, self.ssh_port));
+                c.arg(crate::transport::ssh_remote_command(args));
+                c
+            }
+            None => {
+                let mut c = tokio::process::Command::new(&self.bin);
+                c.args(args);
+                c
+            }
+        };
+        cmd.kill_on_drop(true);
         let out = tokio::time::timeout(timeout, cmd.output())
             .await
             .map_err(|_| {
-                anyhow::anyhow!("timeout {}s: docker {}", timeout.as_secs(), args.join(" "))
+                anyhow::anyhow!("timeout {}s: {}", timeout.as_secs(), self.describe(args))
             })?
-            .with_context(|| format!("spawn {} {}", self.bin.display(), args.join(" ")))?;
+            .with_context(|| format!("spawn {}", self.describe(args)))?;
         if !out.status.success() {
             anyhow::bail!(
-                "docker {} falhou: {}",
-                args.join(" "),
+                "{} falhou: {}",
+                self.describe(args),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
@@ -197,39 +270,55 @@ impl DockerProvider for CliProvider {
             .await
             .unwrap_or((FALLBACK_CORES, FALLBACK_MEM));
         let fmt = "{{.Id}}\t{{.HostConfig.NanoCpus}}\t{{.HostConfig.CpuQuota}}\t{{.HostConfig.CpuPeriod}}\t{{.HostConfig.CpusetCpus}}\t{{.HostConfig.Memory}}";
-        let mut args: Vec<String> = vec![
-            "--context".into(),
-            self.context.clone(),
-            "inspect".into(),
-            "--format".into(),
-            fmt.into(),
-        ];
-        args.extend(ids.iter().cloned());
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let stdout = match self.run_docker(&arg_refs, self.inspect_timeout).await {
-            Ok(s) => s,
-            Err(_) => {
-                // Fallback individual (container pode ter morrido) — igual ao Python.
-                let mut acc = String::new();
-                for id in ids {
-                    let one = vec![
-                        "--context",
-                        self.context.as_str(),
-                        "inspect",
-                        "--format",
-                        fmt,
-                        id.as_str(),
-                    ];
-                    if let Ok(s) = self.run_docker(&one, self.inspect_timeout).await {
-                        acc.push_str(&s);
-                        acc.push('\n');
+        // Lote único de ~57 ids via ssh mediu 25s+ (daemon remoto serializa os
+        // inspects); fatias paralelas dividem a latência. Fatia que falha cai
+        // no fallback per-id (container pode ter morrido) — igual ao Python.
+        let chunks: Vec<&[String]> = ids.chunks(INSPECT_CHUNK).collect();
+        let futs = chunks.into_iter().map(|chunk| {
+            let mut args: Vec<String> = vec![
+                "--context".into(),
+                self.context.clone(),
+                "inspect".into(),
+                "--format".into(),
+                fmt.into(),
+            ];
+            args.extend(chunk.iter().cloned());
+            async move {
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                (
+                    chunk.to_vec(),
+                    self.run_docker(&arg_refs, self.inspect_timeout).await,
+                )
+            }
+        });
+        let results = futures_util::future::join_all(futs).await;
+        let mut acc = String::new();
+        for (chunk, res) in results {
+            match res {
+                Ok(s) => {
+                    acc.push_str(&s);
+                    acc.push('\n');
+                }
+                Err(_) => {
+                    for id in &chunk {
+                        let one = vec![
+                            "--context",
+                            self.context.as_str(),
+                            "inspect",
+                            "--format",
+                            fmt,
+                            id.as_str(),
+                        ];
+                        if let Ok(s) = self.run_docker(&one, self.inspect_timeout).await {
+                            acc.push_str(&s);
+                            acc.push('\n');
+                        }
                     }
                 }
-                acc
             }
-        };
+        }
         let mut out = Vec::new();
-        for line in stdout.lines() {
+        for line in acc.lines() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -246,6 +335,14 @@ impl DockerProvider for CliProvider {
     }
 
     async fn system_info(&self) -> anyhow::Result<(u32, u64)> {
+        {
+            let cached = self.sysinfo_cache.lock().await;
+            if let Some((ts, v)) = *cached {
+                if ts.elapsed() < SYSINFO_TTL {
+                    return Ok(v);
+                }
+            }
+        }
         let stdout = self
             .run_docker(
                 &[
@@ -259,13 +356,15 @@ impl DockerProvider for CliProvider {
             )
             .await?;
         let parts: Vec<&str> = stdout.trim().split('\t').collect();
-        if parts.len() >= 2 {
-            if let (Ok(c), Ok(m)) = (
-                parts[0].trim().parse::<u32>(),
-                parts[1].trim().parse::<u64>(),
-            ) {
-                return Ok((c.max(1), m));
+        let parsed = parts.first().zip(parts.get(1)).and_then(|(c, m)| {
+            match (c.trim().parse::<u32>(), m.trim().parse::<u64>()) {
+                (Ok(c), Ok(m)) => Some((c.max(1), m)),
+                _ => None,
             }
+        });
+        if let Some(v) = parsed {
+            *self.sysinfo_cache.lock().await = Some((std::time::Instant::now(), v));
+            return Ok(v);
         }
         anyhow::bail!("info parse falhou p/ {}", self.context)
     }
@@ -858,6 +957,104 @@ mod tests {
         assert_eq!(limits[1].0, "fedcba654321");
         assert_eq!(limits[0].1.mem_limit, 268_435_456.0);
         assert_eq!(limits[1].1.mem_limit, 536_870_912.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_ssh_direct_drops_local_context_and_runs_remote_docker() {
+        let dir = std::env::temp_dir().join(format!("dtsshprov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("args.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\ncase \"$*\" in\n  *stats*) printf 'abcdef123456\\tweb\\t5.0%%\\t100MiB / 1GiB\\t9.7%%\\t1MiB / 1MiB\\t1MiB / 1MiB\\t3\\n' ;;\n  *info*) printf '4\\t8589934592\\n' ;;\n  *) exit 2 ;;\nesac\n",
+            log.display()
+        );
+        let bin = dir.join("ssh");
+        std::fs::write(&bin, &script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // bin local propositalmente inexistente: prova que o modo ssh não o usa.
+        let p = CliProvider::new(
+            "homeserver".into(),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        )
+        .with_bin(PathBuf::from("/nonexistent-dt-docker"))
+        .with_ssh_bin(bin)
+        .with_ssh_host(Some("home-host".into()));
+
+        let rows = p.list_stats().await.expect("ssh-direct stats");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("BatchMode=yes"), "{logged}");
+        assert!(logged.contains("ConnectTimeout="), "{logged}");
+        assert!(
+            logged.contains("StrictHostKeyChecking=accept-new"),
+            "{logged}"
+        );
+        assert!(logged.lines().any(|l| l == "home-host"), "{logged}");
+        // comando remoto único e quotado: template Go não pode sofrer brace
+        // expansion no shell remoto (daemon já recebeu "{{.Name}}" como arg).
+        let remote = logged
+            .lines()
+            .find(|l| l.starts_with("docker "))
+            .expect("comando remoto presente");
+        assert!(remote.starts_with("docker 'stats'"), "{remote}");
+        assert!(remote.contains("'--format'"), "{remote}");
+        assert!(remote.contains("'{{.ID}}"), "{remote}");
+        assert!(remote.ends_with("{{.PIDs}}'"), "{remote}");
+        // args docker só dentro do comando remoto — nada além dele no argv
+        // (bug real: args crus concatenados ao comando viravam nomes de
+        // container no daemon remoto: "No such container: stats").
+        assert_eq!(
+            logged.lines().count(),
+            8,
+            "esperados 7 args base + 1 comando remoto, log: {logged}"
+        );
+        // --context é conceito do docker local e NÃO atravessa o ssh
+        assert!(!logged.contains("--context"), "{logged}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cli_provider_system_info_uses_ttl_cache_within_same_tick() {
+        let dir = std::env::temp_dir().join(format!("dtsyscache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("info.log");
+        let script = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *info*) echo called >> {}; printf '4\\t8589934592\\n' ;;\n  *) exit 2 ;;\nesac\n",
+            log.display()
+        );
+        let bin = dir.join("docker");
+        std::fs::write(&bin, &script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let p = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .with_bin(bin);
+
+        let a = p.system_info().await.expect("info 1");
+        let b = p.system_info().await.expect("info 2");
+        assert_eq!(a, b);
+        let calls = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(
+            calls, 1,
+            "2ª chamada deve vir do cache TTL (evita info duplicado)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -39,6 +39,15 @@ pub struct Cli {
     /// Caminho alternativo do config TOML.
     #[arg(long, env = "DOCKER_TOP_CONFIG")]
     pub config: Option<std::path::PathBuf>,
+    /// Arquivo de log (append). Ex.: `--log ~/.local/state/docker-top/log.txt`.
+    #[arg(long, env = "DOCKER_TOP_LOG")]
+    pub log: Option<std::path::PathBuf>,
+    /// Contextos `ssh://` via `ssh <host> docker ...` direto (BatchMode/ConnectTimeout).
+    #[arg(long, env = "DOCKER_TOP_SSH_DIRECT")]
+    pub ssh_direct: bool,
+    /// Sonda hosts de `~/.ssh/config` com `docker version` e adiciona como contextos.
+    #[arg(long, env = "DOCKER_TOP_SSH_HOSTS")]
+    pub ssh_hosts: bool,
     /// Gera `config.example.toml` versionado e sai.
     #[arg(long)]
     pub generate_config_example: bool,
