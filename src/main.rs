@@ -10,12 +10,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
-use crossterm::event::{Event, EventStream, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
-use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
@@ -245,10 +244,31 @@ async fn run_tui(
     #[cfg(not(unix))]
     let mut sighup: Option<tokio::signal::unix::Signal> = None;
 
-    let mut events = EventStream::new();
+    // Eventos via polling síncrono (não-bloqueante) no tick do heartbeat.
+    // O EventStream async do crossterm tem thread leitora com epoll pouco
+    // confiável sob carga — com strace, tecla no buffer ficou 3-6s sem ser
+    // lida e batch de rows no canal sem acordar o select. Pollando no loop:
+    // teclas e rows garantidas em ≤ HEARTBEAT.
+    const EVENT_HEARTBEAT: Duration = Duration::from_millis(250);
     terminal.draw(|f| ui::render(f, &state, &cfg))?;
 
-    loop {
+    'tui: loop {
+        // drena teclas disponíveis (não-bloqueante)
+        while crossterm::event::poll(Duration::ZERO)? {
+            let ev = crossterm::event::read()?;
+            if handle_event(
+                ev,
+                &mut state,
+                &mut cfg,
+                &cli,
+                &config_path,
+                &cfg_shared,
+                &selected_shared,
+            )? {
+                break 'tui;
+            }
+            terminal.draw(|f| ui::render(f, &state, &cfg))?;
+        }
         tokio::select! {
             biased;
             Some(out) = rx.recv() => {
@@ -259,18 +279,8 @@ async fn run_tui(
                 // evict é feito no collector; aqui só re-render
                 terminal.draw(|f| ui::render(f, &state, &cfg))?;
             }
-            Some(Ok(ev)) = events.next() => {
-                if handle_event(
-                    ev,
-                    &mut state,
-                    &mut cfg,
-                    &cli,
-                    &config_path,
-                    &cfg_shared,
-                    &selected_shared,
-                )? {
-                    break;
-                }
+            _ = tokio::time::sleep(EVENT_HEARTBEAT) => {
+                // volta pro topo: drena teclas + re-render barato (diff vazio = sem saída)
                 terminal.draw(|f| ui::render(f, &state, &cfg))?;
             }
             _ = async {
