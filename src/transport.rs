@@ -189,6 +189,154 @@ fn default_endpoint_for(name: &str) -> String {
     }
 }
 
+/// Destino ssh `[user@]host` + porta de `ssh://[user@]host[:port]`.
+/// O usuário é preservado (sem ele o ssh usaria o usuário local); porta vira `-p`.
+pub fn ssh_dest_from_endpoint(endpoint: &str) -> Option<(String, Option<u16>)> {
+    let rest = endpoint.strip_prefix("ssh://")?;
+    let rest = rest.split('/').next().unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let (dest, port) = match rest.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h, p.parse::<u16>().ok())
+        }
+        _ => (rest, None),
+    };
+    (!dest.is_empty()).then(|| (dest.to_string(), port))
+}
+
+/// Aliases `Host` de um ssh_config (sem globs `*?`, sem comentários).
+/// Pragmático: não resolve `Match` blocks nem `Include`.
+pub fn parse_ssh_config_hosts(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (kw, rest) = match line.split_once('=') {
+            Some((k, r)) => (k.trim(), r.trim()),
+            None => line.split_once(char::is_whitespace).unwrap_or((line, "")),
+        };
+        if !kw.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        for alias in rest.split_whitespace() {
+            if alias.contains(['*', '?', '!']) {
+                continue;
+            }
+            if !out.iter().any(|a| a == alias) {
+                out.push(alias.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Lê os aliases de `~/.ssh/config` (arquivo ausente → vazio).
+pub fn read_ssh_config_hosts() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    match std::fs::read_to_string(home.join(".ssh/config")) {
+        Ok(text) => parse_ssh_config_hosts(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Timeout de conexão/sondagem por host no modo SSH direto.
+pub const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Opções ssh não-interativas compartilhadas (BatchMode evita prompt travar o spawn).
+pub fn ssh_base_args(dest: &str, port: Option<u16>) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        format!("ConnectTimeout={}", SSH_CONNECT_TIMEOUT.as_secs().max(1)),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+    if let Some(p) = port {
+        args.push("-p".to_string());
+        args.push(p.to_string());
+    }
+    args.push(dest.to_string());
+    args
+}
+
+/// Quota um arg p/ o shell remoto (single quotes; `'` → `'\''`).
+/// Sem isso o shell remoto expande as chaves do template Go (`{{.ID}}` etc.).
+pub fn ssh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Comando remoto único: `docker` + args quotados. ssh concatena os args do
+/// comando com espaços e o shell remoto os reinterpreta — um arg só, quotado.
+pub fn ssh_remote_command(docker_args: &[&str]) -> String {
+    std::iter::once("docker".to_string())
+        .chain(docker_args.iter().map(|a| ssh_quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Sonda candidatos `ssh <host> docker version` (paralelo) e devolve os que
+/// têm daemon Docker, excluindo nomes já descobertos como docker contexts.
+pub async fn discover_ssh_hosts(
+    candidates: Vec<String>,
+    exclude: &[String],
+    probe_timeout: Duration,
+) -> Vec<DockerContext> {
+    discover_ssh_hosts_with(
+        std::path::Path::new("ssh"),
+        candidates,
+        exclude,
+        probe_timeout,
+    )
+    .await
+}
+
+/// Variante testável com binário ssh explícito (sem tocar PATH global).
+pub async fn discover_ssh_hosts_with(
+    ssh_bin: &std::path::Path,
+    candidates: Vec<String>,
+    exclude: &[String],
+    probe_timeout: Duration,
+) -> Vec<DockerContext> {
+    let probes = candidates
+        .into_iter()
+        .filter(|h| !exclude.iter().any(|e| e == h))
+        .map(|host| {
+            let ssh_bin = ssh_bin.to_path_buf();
+            async move {
+                let args: Vec<String> = ssh_base_args(&host, None);
+                let remote_cmd =
+                    ssh_remote_command(&["version", "--format", "{{.Server.Version}}"]);
+                let mut arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                arg_refs.push(&remote_cmd);
+                let mut cmd = tokio::process::Command::new(&ssh_bin);
+                cmd.args(&arg_refs).kill_on_drop(true);
+                let ok = matches!(
+                    tokio::time::timeout(probe_timeout, cmd.output()).await,
+                    Ok(Ok(out)) if out.status.success()
+                );
+                (host, ok)
+            }
+        });
+    let results = futures_util::future::join_all(probes).await;
+    results
+        .into_iter()
+        .filter_map(|(host, ok)| {
+            ok.then(|| DockerContext {
+                name: host.clone(),
+                endpoint: format!("ssh://{host}"),
+                transport: Transport::Cli,
+            })
+        })
+        .collect()
+}
+
 async fn list_context_names(docker_bin: &std::path::Path, timeout: Duration) -> Vec<String> {
     let attempt = || async {
         tokio::process::Command::new(docker_bin)
@@ -508,5 +656,106 @@ exit 42
             discover_with(&bin, &dir.join("missing-meta"), Duration::from_millis(50)).await;
         assert_eq!(discovered.names(), vec!["default"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_host_extraction_covers_user_port_and_garbage() {
+        assert_eq!(
+            ssh_dest_from_endpoint("ssh://lgldsilva@192.168.0.100"),
+            Some(("lgldsilva@192.168.0.100".to_string(), None))
+        );
+        assert_eq!(
+            ssh_dest_from_endpoint("ssh://code-server"),
+            Some(("code-server".to_string(), None))
+        );
+        assert_eq!(
+            ssh_dest_from_endpoint("ssh://user@host:2222"),
+            Some(("user@host".to_string(), Some(2222)))
+        );
+        assert_eq!(ssh_dest_from_endpoint("unix:///var/run/docker.sock"), None);
+        assert_eq!(ssh_dest_from_endpoint("ssh://"), None);
+    }
+
+    #[test]
+    fn ssh_config_parser_keeps_aliases_and_skips_globs_and_other_keywords() {
+        let cfg = r#"
+# comentário
+Host * !bastion
+	HostName ignored.example
+
+Host oracle-desktop code-server
+	HostName 144.22.169.95
+	User lgldsilva
+
+Host=ubuntu-arm
+Host bastion-p4
+HostName aloneshouldnotmatch
+match exec "true"
+  Host nested-in-match
+"#;
+        assert_eq!(
+            parse_ssh_config_hosts(cfg),
+            vec![
+                "oracle-desktop".to_string(),
+                "code-server".to_string(),
+                "ubuntu-arm".to_string(),
+                "bastion-p4".to_string(),
+                "nested-in-match".to_string(),
+            ]
+        );
+        assert!(parse_ssh_config_hosts("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ssh_hosts_discovery_probes_with_fake_ssh_and_excludes_known() {
+        let dir = std::env::temp_dir().join(format!("dtssh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // `ssh` fake que aceita qualquer host, menos host-down.
+        let script = "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in host-down) exit 255 ;; esac; done\nexit 0\n";
+        let bin = dir.join("ssh");
+        std::fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let discovered = discover_ssh_hosts_with(
+            &bin,
+            vec!["host-ok".into(), "host-down".into()],
+            &[],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name, "host-ok");
+        assert_eq!(discovered[0].endpoint, "ssh://host-ok");
+        // exclude remove candidatos já presentes como docker context
+        let excluded = discover_ssh_hosts_with(
+            &bin,
+            vec!["host-ok".into()],
+            &["host-ok".into()],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(excluded.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_base_args_are_non_interactive_and_bounded() {
+        let args = ssh_base_args("myhost", Some(2222));
+        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-o" && w[1].starts_with("ConnectTimeout=")));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-o", "StrictHostKeyChecking=accept-new"]));
+        assert!(args.windows(2).any(|w| w == ["-p", "2222"]));
+        assert_eq!(args.last().map(String::as_str), Some("myhost"));
+        // sem porta não há -p
+        let args = ssh_base_args("myhost", None);
+        assert!(!args.contains(&"-p".to_string()));
     }
 }

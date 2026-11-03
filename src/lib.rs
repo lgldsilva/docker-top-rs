@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod collector;
 pub mod config;
+pub mod logging;
 pub mod model;
 pub mod parsers;
 pub mod provider;

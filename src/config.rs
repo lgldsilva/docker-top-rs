@@ -45,7 +45,10 @@ impl Default for Timeouts {
         Self {
             context_ls: 3.0,
             info: 3.0,
-            stats: 10.0,
+            // 30s: `stats --no-stream` via SSH em hosts com dezenas de containers
+            // mede ~8s baseline e pode estourar 10s sob carga (causa de remotos
+            // sumirem silenciosamente — ver docs/troubleshooting no README).
+            stats: 30.0,
             inspect: 30.0,
         }
     }
@@ -237,6 +240,12 @@ pub struct AppConfig {
     pub filter: String,
     /// Contexto inicial (`all` ou nome).
     pub context: String,
+    /// `ssh://` via `ssh <host> docker ...` direto (BatchMode/ConnectTimeout),
+    /// em vez de `docker --context`. Útil quando o mecanismo de context falha
+    /// ou para controlar as opções ssh.
+    pub ssh_direct: bool,
+    /// Descobre hosts adicionais em `~/.ssh/config` sondando `docker version`.
+    pub ssh_hosts: bool,
     pub timeouts: Timeouts,
     pub thresholds: Thresholds,
     pub layout: Layout,
@@ -253,6 +262,8 @@ impl Default for AppConfig {
             ascending: false,
             filter: String::new(),
             context: "all".to_string(),
+            ssh_direct: false,
+            ssh_hosts: false,
             timeouts: Timeouts::default(),
             thresholds: Thresholds::default(),
             layout: Layout::default(),
@@ -285,13 +296,19 @@ impl AppConfig {
                 figment::value::Value::from(c.clone()),
             );
         }
+        if cli.ssh_direct {
+            cli_map.insert("ssh_direct".to_string(), figment::value::Value::from(true));
+        }
+        if cli.ssh_hosts {
+            cli_map.insert("ssh_hosts".to_string(), figment::value::Value::from(true));
+        }
         Figment::from(Serialized::defaults(AppConfig::default()))
             .merge(Toml::file(config_path))
-            .merge(
-                Env::prefixed("DOCKER_TOP_")
-                    .split("__")
-                    .ignore(&["DELAY", "SORT", "ASC", "FILTER", "CONTEXT", "CONFIG"]),
-            )
+            .merge(Env::prefixed("DOCKER_TOP_").split("__").ignore(&[
+                "DELAY", "SORT", "ASC", "FILTER", "CONTEXT", "CONFIG",
+                // consumidos pelo clap (não são campos do AppConfig):
+                "LOG",
+            ]))
             .merge(Serialized::defaults(cli_map))
     }
 
@@ -353,6 +370,9 @@ mod tests {
             context: None,
             once: false,
             config: None,
+            log: None,
+            ssh_direct: false,
+            ssh_hosts: false,
             generate_config_example: false,
         }
     }
