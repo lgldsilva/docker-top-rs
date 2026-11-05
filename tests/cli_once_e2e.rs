@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -153,6 +155,26 @@ fn config_example_and_invalid_config_cli_paths_are_end_to_end() {
     let _ = fs::remove_dir_all(&home);
 }
 
+/// Drain a PTY stream into a shared buffer so the pipe never blocks the
+/// child and the buffer can be polled for readiness.
+fn drain_into<R: Read + Send + 'static>(
+    mut pipe: R,
+    buf: Arc<Mutex<String>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf
+                    .lock()
+                    .expect("lock PTY buffer")
+                    .push_str(&String::from_utf8_lossy(&chunk[..n])),
+            }
+        }
+    })
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn tui_starts_and_quits_under_a_pseudo_terminal() {
@@ -227,7 +249,31 @@ esac
     }
     let mut child = command.spawn().expect("start script with a PTY");
     let mut input = child.stdin.take().expect("script stdin");
-    std::thread::sleep(Duration::from_millis(500));
+    let stdout_pipe = child.stdout.take().expect("script stdout");
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stdout_thread = drain_into(stdout_pipe, Arc::clone(&stdout_buf));
+
+    // TUI is up once it enters the alternate screen; poll instead of a fixed
+    // sleep so slow starts wait and broken starts fail fast (10s deadline).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if stdout_buf
+            .lock()
+            .expect("lock PTY buffer")
+            .contains("\u{1b}[?1049h")
+        {
+            break;
+        }
+        if child.try_wait().expect("poll PTY process").is_some() {
+            panic!("docker-top-rs exited before the TUI was ready");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("docker-top-rs TUI did not start within 10s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     input.write_all(b"q").expect("send quit key");
     drop(input);
 
@@ -244,8 +290,9 @@ esac
         std::thread::sleep(Duration::from_millis(50));
     }
     let output = child.wait_with_output().expect("collect PTY output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    stdout_thread.join().expect("join stdout drain");
+    let stdout = stdout_buf.lock().expect("lock PTY buffer").clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "stderr: {stderr}");
     assert!(
         stdout.contains("docker-top-rs finalizado."),
