@@ -400,7 +400,11 @@ mod tests {
     fn write_stdin_probe_bin(path: &std::path::Path, stdout_payload: &str, report_file: &str) {
         let mut f = std::fs::File::create(path).unwrap();
         writeln!(f, "#!/bin/sh").unwrap();
-        writeln!(f, "tgt=$(readlink /dev/fd/0 2>/dev/null || readlink /proc/self/fd/0)").unwrap();
+        writeln!(
+            f,
+            "tgt=$(readlink /dev/fd/0 2>/dev/null || readlink /proc/self/fd/0)"
+        )
+        .unwrap();
         if report_file.is_empty() {
             writeln!(f, "printf '%s\\n' \"stdin=$tgt\"").unwrap();
         } else {
