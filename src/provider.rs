@@ -203,6 +203,10 @@ impl CliProvider {
                 c
             }
         };
+        // CRÍTICO: tokio output() só pipa stdout/stderr — sem isso o stdin
+        // herda o TTY e o ssh drena a fila de input, engolindo as teclas
+        // do usuário antes do crossterm ler (setas de ordenação "sumiam").
+        cmd.stdin(std::process::Stdio::null());
         cmd.kill_on_drop(true);
         let out = tokio::time::timeout(timeout, cmd.output())
             .await
@@ -1012,10 +1016,12 @@ mod tests {
         // args docker só dentro do comando remoto — nada além dele no argv
         // (bug real: args crus concatenados ao comando viravam nomes de
         // container no daemon remoto: "No such container: stats").
+        // 8 args base: -n + 6 opções/destino (-o BatchMode, -o ConnectTimeout,
+        // -o StrictHostKeyChecking, host) + 1 comando remoto.
         assert_eq!(
             logged.lines().count(),
-            8,
-            "esperados 7 args base + 1 comando remoto, log: {logged}"
+            9,
+            "esperados 8 args base (-n incluso) + 1 comando remoto, log: {logged}"
         );
         // --context é conceito do docker local e NÃO atravessa o ssh
         assert!(!logged.contains("--context"), "{logged}");
