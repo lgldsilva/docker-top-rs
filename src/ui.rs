@@ -211,15 +211,19 @@ fn col_width(key: &str, mode: u8) -> Constraint {
         ("name", 0) => Constraint::Min(6),
         ("name", _) => Constraint::Min(8),
         ("cpu_rel" | "mem_rel", 0) => Constraint::Length(6),
-        ("cpu_rel" | "mem_rel", _) => Constraint::Length(8),
+        ("cpu_rel" | "mem_rel", 1) => Constraint::Length(8),
+        // full: "CPU_REL ▼"/"MEM_REL ▼" = 9 chars — 8 truncava a seta.
+        ("cpu_rel" | "mem_rel", 2) => Constraint::Length(9),
         ("cpu", 0) => Constraint::Length(6),
         ("cpu", _) => Constraint::Length(8),
-        ("pids", 0) => Constraint::Length(4),
-        ("pids", _) => Constraint::Length(5),
+        // ultra: "PID ▼" = 5 chars; compacto/full: 6 chars.
+        ("pids", 0) => Constraint::Length(5),
+        ("pids", _) => Constraint::Length(6),
         ("mem_used" | "net" | "block", 0) => Constraint::Length(7),
-        ("mem_used" | "mem_lim" | "net_rx" | "net_tx" | "block_read" | "block_write", 2) => {
-            Constraint::Length(11)
-        }
+        ("mem_used" | "mem_lim" | "net_rx" | "net_tx", 2) => Constraint::Length(11),
+        // full: títulos + seta — 11 truncava ("BLOCK_READ ▼"=12, "BLOCK_WRITE ▼"=13).
+        ("block_read", 2) => Constraint::Length(12),
+        ("block_write", 2) => Constraint::Length(13),
         ("mem_used" | "mem_lim" | "net" | "block", 1) => Constraint::Length(10),
         (_, 0) => Constraint::Length(8),
         (_, 1) => Constraint::Length(9),
@@ -531,6 +535,48 @@ mod tests {
         let s = summary_text(&state, &cfg);
         assert!(s.contains("default:api"));
         assert!(s.contains("homeserver:cli"));
+    }
+
+    /// Regressão: em full mode o título longo + seta (ex.: "MEM_REL ▼" = 9
+    /// chars) era truncado por col_width (Length(8)) — a seta sumia nas
+    /// colunas de título largo (CPU_REL, MEM_REL, BLOCK_READ, BLOCK_WRITE,
+    /// PIDS) ao circular com ←/→ ou usar as hotkeys.
+    #[test]
+    fn header_arrow_visible_for_every_column_at_full_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let cases = [
+            ("id", "ID"),
+            ("context", "CONTEXT"),
+            ("name", "NAME"),
+            ("cpu_rel", "CPU_REL"),
+            ("mem_rel", "MEM_REL"),
+            ("cpu", "CPU"),
+            ("mem_used", "MEM_USED"),
+            ("cpu_lim", "CPU_LIM"),
+            ("mem_lim", "MEM_LIM"),
+            ("net_rx", "NET_RX"),
+            ("net_tx", "NET_TX"),
+            ("block_read", "BLOCK_READ"),
+            ("block_write", "BLOCK_WRITE"),
+            ("pids", "PIDS"),
+        ];
+        for (key, title) in cases {
+            for (desc, arrow) in [(true, "▼"), (false, "▲")] {
+                let (mut state, cfg) = sample_state();
+                state.sort_by = key.to_string();
+                state.desc = desc;
+                let backend = TestBackend::new(223, 30);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+                let text = terminal.backend().to_string();
+                let want = format!("{title} {arrow}");
+                assert!(
+                    text.contains(&want),
+                    "sort_by={key} desc={desc}: '{want}' ausente do header (truncado?)\n{text}"
+                );
+            }
+        }
     }
 
     #[test]
