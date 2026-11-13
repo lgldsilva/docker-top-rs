@@ -121,6 +121,7 @@ fn decide_transport(endpoint: &str) -> Transport {
 pub fn resolve_docker_bin() -> PathBuf {
     if std::process::Command::new("docker")
         .arg("--version")
+        .stdin(std::process::Stdio::null())
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -251,6 +252,9 @@ pub const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Opções ssh não-interativas compartilhadas (BatchMode evita prompt travar o spawn).
 pub fn ssh_base_args(dest: &str, port: Option<u16>) -> Vec<String> {
     let mut args = vec![
+        // -n: impede o ssh de ler stdin (senão drena o TTY do usuário e
+        // engole as teclas da TUI; BatchMode so cobre prompts).
+        "-n".to_string(),
         "-o".to_string(),
         "BatchMode=yes".to_string(),
         "-o".to_string(),
@@ -316,7 +320,9 @@ pub async fn discover_ssh_hosts_with(
                 let mut arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 arg_refs.push(&remote_cmd);
                 let mut cmd = tokio::process::Command::new(&ssh_bin);
-                cmd.args(&arg_refs).kill_on_drop(true);
+                cmd.args(&arg_refs)
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true);
                 let ok = matches!(
                     tokio::time::timeout(probe_timeout, cmd.output()).await,
                     Ok(Ok(out)) if out.status.success()
@@ -341,6 +347,7 @@ async fn list_context_names(docker_bin: &std::path::Path, timeout: Duration) -> 
     let attempt = || async {
         tokio::process::Command::new(docker_bin)
             .args(["context", "ls", "--format", "{{.Name}}"])
+            .stdin(std::process::Stdio::null())
             .output()
             .await
     };
@@ -385,6 +392,88 @@ mod tests {
         let d = dir.join(hash);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("meta.json"), body).unwrap();
+    }
+
+    /// Cria um binário falso que reporta o alvo do próprio fd 0.
+    /// `report_file` vazio: imprime no stdout (flui pelo path do chamador);
+    /// com caminho: grava o report no arquivo (para paths que descartam stdout).
+    fn write_stdin_probe_bin(path: &std::path::Path, stdout_payload: &str, report_file: &str) {
+        let mut f = std::fs::File::create(path).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "tgt=$(readlink /dev/fd/0 2>/dev/null || readlink /proc/self/fd/0)").unwrap();
+        if report_file.is_empty() {
+            writeln!(f, "printf '%s\\n' \"stdin=$tgt\"").unwrap();
+        } else {
+            writeln!(f, "printf '%s\\n' \"stdin=$tgt\" > '{report_file}'").unwrap();
+        }
+        writeln!(f, "printf '{stdout_payload}\\n'").unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn assert_null_stdin_name(names: &[String], what: &str) {
+        let joined = names.join("|");
+        assert!(
+            names.iter().any(|n| n == "stdin=/dev/null"),
+            "{what}: stdin herdado (nao-null) nos filhos; contexts={joined:?}"
+        );
+    }
+
+    /// Regressão: filhos ssh/docker herdavam o stdin do TTY (tokio output()
+    /// só pipa stdout/stderr) e o ssh drenava a fila de input do terminal,
+    /// engolindo as teclas do usuario antes do crossterm ler.
+    /// Limitação conhecida: se o stdin do próprio harness já for /dev/null
+    /// (comum em runners de CI), o teste passa mesmo sem o fix — a detecção
+    /// real acontece em ambiente local/TTY; em produção há defesa dupla
+    /// (Stdio::null + ssh -n).
+    #[tokio::test]
+    async fn spawned_docker_has_null_stdin() {
+        let dir = std::env::temp_dir().join(format!("dtstdin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("docker");
+        write_stdin_probe_bin(&bin, "default", "");
+        let meta = dir.join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        write_meta(
+            &meta,
+            "aaaa",
+            r#"{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}"#,
+        );
+        let d = discover_with(&bin, &meta, Duration::from_secs(10)).await;
+        let names: Vec<String> = d.contexts.iter().map(|c| c.name.clone()).collect();
+        assert_null_stdin_name(&names, "docker context ls");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regressão: o ssh do probe de hosts tambem herdava o stdin do TTY.
+    #[tokio::test]
+    async fn spawned_ssh_has_null_stdin() {
+        let dir = std::env::temp_dir().join(format!("dtsshin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("ssh");
+        let report = dir.join("ssh-stdin.txt");
+        let report = report.to_str().unwrap().to_string();
+        write_stdin_probe_bin(&bin, "8.9.10.11", &report);
+        let extra = discover_ssh_hosts_with(
+            &bin,
+            vec!["fakehost".to_string()],
+            &["default".to_string()],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(extra.len(), 1, "probe do fake ssh falhou: {:?}", extra);
+        let recorded = std::fs::read_to_string(&report).unwrap_or_default();
+        assert!(
+            recorded.contains("stdin=/dev/null"),
+            "ssh probe: stdin herdado (nao-null): {recorded:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -745,6 +834,8 @@ match exec "true"
     #[test]
     fn ssh_base_args_are_non_interactive_and_bounded() {
         let args = ssh_base_args("myhost", Some(2222));
+        // -n: ssh nao pode ler stdin (senao drena o TTY do usuario)
+        assert!(args.contains(&"-n".to_string()));
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
         assert!(args
             .windows(2)
