@@ -38,19 +38,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn visible_rows(&self, cfg: &AppConfig, term_width: u16) -> Vec<ContainerSnapshot> {
-        let show_ctx = self.selected_context == "all";
-        let cols_cfg = &cfg.columns;
-        let mut cols = visible_columns(
-            term_width,
-            cfg.layout.compact_width,
-            cfg.layout.wide_width,
-            cols_cfg,
-        );
-        if show_ctx && !cols.contains(&"context".to_string()) {
-            if let Some(pos) = cols.iter().position(|c| c == "id") {
-                cols.insert(pos + 1, "context".to_string());
-            }
-        }
+        let cols = effective_columns(self, cfg, term_width);
         let sort = normalize_sort(&self.sort_by, &cols);
         let mut rows: Vec<ContainerSnapshot> = self
             .rows
@@ -183,7 +171,11 @@ fn header_title(base: &str, key: &str, sort_by: &str, desc: bool) -> String {
     }
 }
 
-/// Colunas efetivas p/ render (inclui context quando `all`).
+/// Colunas efetivas p/ render (inclui context quando `all`). Em painéis
+/// ultra-estreitos (< compact_width) retira as colunas finais até o conjunto
+/// caber com a seta de ordenação — antes o ratatui espremia/truncava os
+/// títulos e a seta do sort ativo sumia (inclusive nas duas primeiras
+/// colunas: ID/CTX), reporte 13/11 pós-PR #5.
 pub fn effective_columns(state: &AppState, cfg: &AppConfig, width: u16) -> Vec<String> {
     let mut cols = visible_columns(
         width,
@@ -196,7 +188,41 @@ pub fn effective_columns(state: &AppState, cfg: &AppConfig, width: u16) -> Vec<S
             cols.insert(pos + 1, "context".to_string());
         }
     }
+    let mode: u8 = if width < cfg.layout.compact_width {
+        0
+    } else if width < cfg.layout.wide_width {
+        1
+    } else {
+        2
+    };
+    // inner do bloco da tabela = width - 2 bordas; +1 de gap por coluna.
+    // Só o ultra-compacto perde colunas: lá o título+seta ocupa quase toda a
+    // largura (slack ≤ 2) e o solver comia a seta ao espremer. No compacto/full
+    // os títulos curtos têm slack ≥ 3 e a seta sobrevive ao squeeze (coberto
+    // pelo teste de regressão em todas as bandas).
+    if mode == 0 {
+        let avail = width.saturating_sub(2);
+        while cols.len() > 3 {
+            let needed: u16 = cols
+                .iter()
+                .map(|c| min_col_width(c, mode))
+                .sum::<u16>()
+                .saturating_add(cols.len() as u16 - 1);
+            if needed <= avail {
+                break;
+            }
+            cols.pop();
+        }
+    }
     cols
+}
+
+/// Largura mínima de uma coluna (o que o `Length`/`Min` de `col_width` exige).
+fn min_col_width(key: &str, mode: u8) -> u16 {
+    match col_width(key, mode) {
+        Constraint::Length(n) | Constraint::Min(n) => n,
+        _ => 8,
+    }
 }
 
 fn col_width(key: &str, mode: u8) -> Constraint {
@@ -575,6 +601,50 @@ mod tests {
                     text.contains(&want),
                     "sort_by={key} desc={desc}: '{want}' ausente do header (truncado?)\n{text}"
                 );
+            }
+        }
+    }
+
+    /// Regressão (reporte 13/11, pós-PR #5): a seta de ordenação seguia
+    /// sumindo em painéis estreitos — em ultra-compacto a tabela estourava e o
+    /// ratatui truncava o fim do título (a seta), inclusive nas DUAS PRIMEIRAS
+    /// colunas (ID em ≤ 23 cols, CTX em ≤ 26) e em CPR/MER/CPU/MEM/NET/DISC/PID
+    /// até ~68 cols. O PR #5 só cobriu o full mode a 223 cols.
+    /// Invariante: em toda largura onde as 3 colunas mínimas cabem, TODA coluna
+    /// visível exibe a seta quando é a coluna ordenada.
+    #[test]
+    fn header_arrow_visible_for_every_visible_column_at_any_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // amostra as bandas: faixa estreita crítica inteira (26..=75), fronteiras
+        // de banda ±1 e algumas larguras full (incl. 223, geometria do usuário).
+        let mut widths: Vec<u16> = (26..=75).collect();
+        widths.extend([76, 99, 100, 101, 158, 159, 160, 161, 200, 223, 250]);
+        for ctx_mode in ["all", "default"] {
+            for w in &widths {
+                let w = *w;
+                let (mut state, cfg) = sample_state();
+                state.selected_context = ctx_mode.to_string();
+                let cols = effective_columns(&state, &cfg, w);
+                let mode: u8 = if w < cfg.layout.compact_width {
+                    0
+                } else if w < cfg.layout.wide_width {
+                    1
+                } else {
+                    2
+                };
+                for key in &cols {
+                    state.sort_by = key.clone();
+                    state.desc = true;
+                    let mut terminal = Terminal::new(TestBackend::new(w, 30)).unwrap();
+                    terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+                    let text = terminal.backend().to_string();
+                    let want = format!("{} ▼", short_title(key, mode));
+                    assert!(
+                        text.contains(&want),
+                        "ctx={ctx_mode} w={w} sort={key}: '{want}' ausente do header\n{text}"
+                    );
+                }
             }
         }
     }
