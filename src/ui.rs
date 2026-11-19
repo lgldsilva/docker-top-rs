@@ -171,6 +171,18 @@ fn header_title(base: &str, key: &str, sort_by: &str, desc: bool) -> String {
     }
 }
 
+/// Banda de layout pela largura: 0 ultra-compacto, 1 compacto, 2 full.
+/// Limiares vêm do config — único ponto de verdade (render, colunas e testes).
+fn layout_mode(width: u16, compact_width: u16, wide_width: u16) -> u8 {
+    if width < compact_width {
+        0
+    } else if width < wide_width {
+        1
+    } else {
+        2
+    }
+}
+
 /// Colunas efetivas p/ render (inclui context quando `all`). Em painéis
 /// ultra-estreitos (< compact_width) retira as colunas finais até o conjunto
 /// caber com a seta de ordenação — antes o ratatui espremia/truncava os
@@ -188,13 +200,7 @@ pub fn effective_columns(state: &AppState, cfg: &AppConfig, width: u16) -> Vec<S
             cols.insert(pos + 1, "context".to_string());
         }
     }
-    let mode: u8 = if width < cfg.layout.compact_width {
-        0
-    } else if width < cfg.layout.wide_width {
-        1
-    } else {
-        2
-    };
+    let mode = layout_mode(width, cfg.layout.compact_width, cfg.layout.wide_width);
     // inner do bloco da tabela = width - 2 bordas; +1 de gap por coluna.
     // Só o ultra-compacto perde colunas: lá o título+seta ocupa quase toda a
     // largura (slack ≤ 2) e o solver comia a seta ao espremer. No compacto/full
@@ -202,16 +208,27 @@ pub fn effective_columns(state: &AppState, cfg: &AppConfig, width: u16) -> Vec<S
     // pelo teste de regressão em todas as bandas).
     if mode == 0 {
         let avail = width.saturating_sub(2);
-        while cols.len() > 3 {
-            let needed: u16 = cols
-                .iter()
+        let needed = |cols: &[String]| -> u16 {
+            cols.iter()
                 .map(|c| min_col_width(c, mode))
                 .sum::<u16>()
-                .saturating_add(cols.len() as u16 - 1);
-            if needed <= avail {
-                break;
-            }
+                .saturating_add(cols.len().saturating_sub(1) as u16)
+        };
+        // 1ª fase: derruba colunas finais preservando o trio id/[ctx]/name.
+        while cols.len() > 3 && needed(&cols) > avail {
             cols.pop();
+        }
+        // 2ª fase (issue #8): painel abaixo do mínimo do trio (id+ctx+name
+        // ≈ 26 cols no ctx=all, id+name+1 ≈ 24 no single) — derruba o
+        // `context` e segue até o par id+name (mínimo absoluto, ≥ 17 cols)
+        // caber; o piso antigo `len > 3` mantinha o estouro e o solver
+        // espremia os Length até sumir com a seta.
+        while cols.len() > 2 && needed(&cols) > avail {
+            if let Some(pos) = cols.iter().position(|c| c == "context") {
+                cols.remove(pos);
+            } else {
+                cols.pop();
+            }
         }
     }
     cols
@@ -344,13 +361,7 @@ pub fn render(frame: &mut Frame, state: &AppState, cfg: &AppConfig) {
     let cols = effective_columns(state, cfg, area.width);
     let sort = normalize_sort(&state.sort_by, &cols);
     // modo 0/1/2 = ultra-compacto / compacto / full (larguras do config).
-    let mode: u8 = if area.width < cfg.layout.compact_width {
-        0
-    } else if area.width < cfg.layout.wide_width {
-        1
-    } else {
-        2
-    };
+    let mode = layout_mode(area.width, cfg.layout.compact_width, cfg.layout.wide_width);
     let header_cells: Vec<Cell> = cols
         .iter()
         .map(|c| {
@@ -626,13 +637,7 @@ mod tests {
                 let (mut state, cfg) = sample_state();
                 state.selected_context = ctx_mode.to_string();
                 let cols = effective_columns(&state, &cfg, w);
-                let mode: u8 = if w < cfg.layout.compact_width {
-                    0
-                } else if w < cfg.layout.wide_width {
-                    1
-                } else {
-                    2
-                };
+                let mode = layout_mode(w, cfg.layout.compact_width, cfg.layout.wide_width);
                 for key in &cols {
                     state.sort_by = key.clone();
                     state.desc = true;
@@ -647,6 +652,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Regressão (issue #8): abaixo do mínimo do trio id+[ctx]+name (~26 cols
+    /// no ctx=all) o piso `cols.len() > 3` mantinha um conjunto que não cabia —
+    /// o solver espremia os Length e a seta sumia de novo (ID perdia em ≤ 23,
+    /// CTX em ≤ 25 com ctx=all). Invariante: em toda largura onde o par
+    /// id+name cabe (≥ 17 cols), TODA coluna visível exibe a seta; abaixo do
+    /// mínimo do trio o `context` cai e o par id+name permanece.
+    #[test]
+    fn header_arrow_visible_below_minimum_trio_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        for ctx_mode in ["all", "default"] {
+            for w in 17..=25u16 {
+                let (mut state, cfg) = sample_state();
+                state.selected_context = ctx_mode.to_string();
+                let cols = effective_columns(&state, &cfg, w);
+                let mode = layout_mode(w, cfg.layout.compact_width, cfg.layout.wide_width);
+                assert!(cols.len() >= 2, "ctx={ctx_mode} w={w}: sem colunas mínimas");
+                for key in &cols {
+                    state.sort_by = key.clone();
+                    state.desc = true;
+                    let mut terminal = Terminal::new(TestBackend::new(w, 30)).unwrap();
+                    terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+                    let text = terminal.backend().to_string();
+                    let want = format!("{} ▼", short_title(key, mode));
+                    assert!(
+                        text.contains(&want),
+                        "ctx={ctx_mode} w={w} sort={key}: '{want}' ausente do header\n{text}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #8: compact_width customizado move a banda ultra — a dedução de
+    /// colunas precisa seguir o limiar do config, não o default 100. Em w=50
+    /// com compact_width=60 a renderização é ultra (antes seria compacta) e
+    /// cada coluna visível mantém a seta com o conjunto derrubado até caber.
+    #[test]
+    fn custom_compact_width_moves_band_and_keeps_arrows_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (mut state, mut cfg) = sample_state();
+        state.selected_context = "all".to_string();
+        cfg.layout.compact_width = 60;
+        let w = 50u16;
+        let cols = effective_columns(&state, &cfg, w);
+        // banda ultra: conjunto derrubado até caber com a seta (não é a lista
+        // cheia de 9 colunas do ultra default — o corte precisou agir).
+        assert!(
+            cols.len() < 10,
+            "w={w}: conjunto não foi derrubado: {cols:?}"
+        );
+        for key in &cols {
+            state.sort_by = key.clone();
+            state.desc = true;
+            let mut terminal = Terminal::new(TestBackend::new(w, 30)).unwrap();
+            terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+            let text = terminal.backend().to_string();
+            let want = format!("{} ▼", short_title(key, 0));
+            assert!(
+                text.contains(&want),
+                "w={w} sort={key}: '{want}' ausente do header (cols={cols:?})\n{text}"
+            );
+        }
+    }
+
+    /// Dedução de banda (helper extraído na issue #8): fronteiras exatas e
+    /// limiares customizados do config movem a banda.
+    #[test]
+    fn layout_mode_band_boundaries_follow_config() {
+        assert_eq!(layout_mode(99, 100, 160), 0);
+        assert_eq!(layout_mode(100, 100, 160), 1);
+        assert_eq!(layout_mode(159, 100, 160), 1);
+        assert_eq!(layout_mode(160, 100, 160), 2);
+        assert_eq!(layout_mode(50, 60, 160), 0);
+        assert_eq!(layout_mode(60, 60, 160), 1);
+        assert_eq!(layout_mode(120, 100, 110), 2);
     }
 
     #[test]
