@@ -608,6 +608,63 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Regressão (issue #7): no full mode (≥ 160 cols) as hotkeys r (sort_net)
+    /// e d (sort_block) setam agregados não visíveis (net/block) — a resolução
+    /// caía no visible.first() = id. A sort resolvida (normalizada sobre as
+    /// colunas efetivas) deve ser o vizinho visível, não id.
+    #[test]
+    fn hotkeys_r_and_d_resolve_to_visible_net_block_columns_in_full_mode() {
+        let cli = test_cli();
+        let mut cfg = AppConfig::default();
+        let path = temp_dir("hotkeys");
+        std::fs::write(&path, "").unwrap();
+        let cfg_shared = Arc::new(parking_lot_like::RwLock::new(cfg.clone()));
+        let selected_shared = Arc::new(Mutex::new("all".into()));
+        let mut state = app_state();
+        let kb = cfg.keybindings.clone();
+
+        let net_key = kb.sort_net.chars().next().unwrap();
+        assert!(!send_key(
+            KeyCode::Char(net_key),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        assert_eq!(state.sort_by, "net");
+        let cols = ui::effective_columns(&state, &cfg, 200);
+        assert_eq!(
+            model::normalize_sort(&state.sort_by, &cols),
+            "net_rx",
+            "hotkey r no full mode caiu no id (issue #7)"
+        );
+
+        let block_key = kb.sort_block.chars().next().unwrap();
+        assert!(!send_key(
+            KeyCode::Char(block_key),
+            KeyModifiers::NONE,
+            &mut state,
+            &mut cfg,
+            &cli,
+            &path,
+            &cfg_shared,
+            &selected_shared,
+        )
+        .unwrap());
+        assert_eq!(state.sort_by, "block");
+        let cols = ui::effective_columns(&state, &cfg, 200);
+        assert_eq!(
+            model::normalize_sort(&state.sort_by, &cols),
+            "block_read",
+            "hotkey d no full mode caiu no id (issue #7)"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn filter_edit_mode_handles_commit_cancel_backspace_character_and_other_keys() {
         let cli = test_cli();
