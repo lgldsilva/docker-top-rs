@@ -275,11 +275,15 @@ pub fn visible_columns(
     }
 }
 
-/// Normaliza sort para coluna visível (agrupa rx/tx→net, read/write→block).
+/// Normaliza sort para coluna visível: agrupa rx/tx→net, read/write→block
+/// (bandas compactas) e, no full mode, expande net→net_rx e block→block_read
+/// para o vizinho visível — antes o agregado não visível caía silenciosamente
+/// no `visible.first()` (id), issue #7.
 pub fn normalize_sort(sort_by: &str, visible: &[String]) -> String {
     if visible.contains(&sort_by.to_string()) {
         return sort_by.to_string();
     }
+    // rx/tx (read/write) → agregado quando só o total está visível.
     if ["net_rx", "net_tx", "net"].contains(&sort_by) && visible.contains(&"net".to_string()) {
         return "net".to_string();
     }
@@ -287,6 +291,25 @@ pub fn normalize_sort(sort_by: &str, visible: &[String]) -> String {
         && visible.contains(&"block".to_string())
     {
         return "block".to_string();
+    }
+    // Expansão reversa (full mode): o agregado não está visível, mas as
+    // colunas detalhadas sim — mapeia para o vizinho visível mais próximo
+    // (net→net_rx, senão net_tx; block→block_read, senão block_write).
+    if sort_by == "net" {
+        if visible.contains(&"net_rx".to_string()) {
+            return "net_rx".to_string();
+        }
+        if visible.contains(&"net_tx".to_string()) {
+            return "net_tx".to_string();
+        }
+    }
+    if sort_by == "block" {
+        if visible.contains(&"block_read".to_string()) {
+            return "block_read".to_string();
+        }
+        if visible.contains(&"block_write".to_string()) {
+            return "block_write".to_string();
+        }
     }
     visible
         .first()
@@ -396,6 +419,38 @@ mod tests {
         };
         rows[0].apply_limits(&lim);
         assert!((rows[0].cpu_limit - 2.0).abs() < 1e-9);
+    }
+
+    /// Regressão (issue #7): no full mode os agregados net/block NÃO estão
+    /// visíveis (só net_rx/net_tx, block_read/block_write) — normalize_sort
+    /// caía silenciosamente no visible.first() (id). Agora expande o agregado
+    /// para o vizinho visível mais próximo; nas bandas compactas (agregado
+    /// visível) o agrupamento rx/tx→net segue como antes.
+    #[test]
+    fn normalize_expands_aggregates_to_visible_splits_in_full_mode() {
+        let full = vec![
+            "id".to_string(),
+            "name".to_string(),
+            "net_rx".to_string(),
+            "net_tx".to_string(),
+            "block_read".to_string(),
+            "block_write".to_string(),
+        ];
+        assert_eq!(normalize_sort("net", &full), "net_rx");
+        assert_eq!(normalize_sort("block", &full), "block_read");
+        // sem nenhum split visível, mantém o fallback antigo (primeira visível)
+        assert_eq!(normalize_sort("net", &["id".to_string()]), "id");
+        assert_eq!(normalize_sort("block", &["id".to_string()]), "id");
+        // banda compacta: agregado visível segue agrupando rx/tx→net
+        let compact = vec!["net".to_string(), "block".to_string()];
+        assert_eq!(normalize_sort("net", &compact), "net");
+        assert_eq!(normalize_sort("net_rx", &compact), "net");
+        // único split visível: mapeia para ele
+        assert_eq!(normalize_sort("net", &["net_tx".to_string()]), "net_tx");
+        assert_eq!(
+            normalize_sort("block", &["block_write".to_string()]),
+            "block_write"
+        );
     }
 
     #[test]

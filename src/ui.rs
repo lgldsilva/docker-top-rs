@@ -733,6 +733,32 @@ mod tests {
         assert_eq!(layout_mode(120, 100, 110), 2);
     }
 
+    /// Regressão (issue #7): no full mode (≥ 160 cols) as hotkeys r/d pedem
+    /// sort por net/block — agregados não visíveis — e a seta caía no ID sem
+    /// hint. Deve mostrar a seta na coluna detalhada visível (NET_RX /
+    /// BLOCK_READ), nunca no ID.
+    #[test]
+    fn net_block_hotkeys_show_arrow_on_visible_split_columns_in_full_mode() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        for (sort_by, want) in [("net", "NET_RX ▼"), ("block", "BLOCK_READ ▼")] {
+            let (mut state, cfg) = sample_state();
+            state.sort_by = sort_by.to_string();
+            state.desc = true;
+            let mut terminal = Terminal::new(TestBackend::new(223, 30)).unwrap();
+            terminal.draw(|f| render(f, &state, &cfg)).unwrap();
+            let text = terminal.backend().to_string();
+            assert!(
+                text.contains(want),
+                "sort={sort_by}: '{want}' ausente do header (caiu no id?)\n{text}"
+            );
+            assert!(
+                !text.contains("ID ▼"),
+                "sort={sort_by}: seta caiu no ID\n{text}"
+            );
+        }
+    }
+
     #[test]
     fn render_error_and_filter_edit_states() {
         use ratatui::backend::TestBackend;
