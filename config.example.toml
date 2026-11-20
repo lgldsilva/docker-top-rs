@@ -1,0 +1,105 @@
+# docker-top-rs — exemplo de configuração (copie p/ ~/.config/docker-top/config.toml)
+# Hierarquia: default < arquivo < env DOCKER_TOP_* (nested com __) < CLI
+# Hot reload: tecla R ou SIGHUP. Campos desconhecidos = erro (deny_unknown_fields).
+
+refresh_delay = 2.0
+sort = "cpu"
+ascending = false
+filter = ""
+context = "all"
+ssh_direct = false
+ssh_hosts = false
+
+[timeouts]
+context_ls = 3.0
+info = 3.0
+stats = 30.0
+inspect = 30.0
+
+[thresholds]
+warn = 50.0
+crit = 85.0
+cpu_abs_warn = 50.0
+
+[layout]
+compact_width = 100
+wide_width = 160
+reserved_rows = 8
+
+[display]
+byte_format = "binary"
+precision = 2
+clock_format = "%H:%M:%S"
+show_transport_badge = true
+
+[keybindings]
+quit = "q"
+filter = "f"
+sort_id = "i"
+sort_cpu = "c"
+sort_cpu_rel = "x"
+sort_cpu_lim = "l"
+sort_mem_used = "u"
+sort_mem_rel = "m"
+sort_mem_lim = "k"
+sort_net_rx = "1"
+sort_net_tx = "2"
+sort_net = "r"
+sort_block_read = "3"
+sort_block_write = "4"
+sort_block = "d"
+sort_pids = "p"
+sort_name = "n"
+sort_context = "o"
+toggle_order = "s"
+next_context = "tab"
+refresh_inc = "+"
+refresh_dec = "-"
+reload_config = "R"
+
+[columns]
+ultra_compact = [
+    "id",
+    "name",
+    "cpu_rel",
+    "mem_rel",
+    "cpu",
+    "mem_used",
+    "net",
+    "block",
+    "pids",
+]
+compact = [
+    "id",
+    "name",
+    "cpu_rel",
+    "mem_rel",
+    "cpu",
+    "mem_used",
+    "cpu_lim",
+    "mem_lim",
+    "net",
+    "block",
+    "pids",
+]
+full = [
+    "id",
+    "name",
+    "cpu_rel",
+    "mem_rel",
+    "cpu",
+    "mem_used",
+    "cpu_lim",
+    "mem_lim",
+    "net_rx",
+    "net_tx",
+    "block_read",
+    "block_write",
+    "pids",
+]
+
+# Env exemplos:
+#   DOCKER_TOP_REFRESH_DELAY=1.5
+#   DOCKER_TOP_SORT=cpu_rel
+#   DOCKER_TOP_TIMEOUTS__STATS=10
+# CLI: --delay 2 --sort cpu_rel --filter api --context all --once
