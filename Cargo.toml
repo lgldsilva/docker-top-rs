@@ -31,7 +31,7 @@ bollard = { version = "0.20.1", features = ["ssl"] }
 anyhow = "1"
 async-trait = "0.1"
 futures-util = "0.3"
-dirs = "5"
+dirs = "7"
 
 [dev-dependencies]
 proptest = "1"
