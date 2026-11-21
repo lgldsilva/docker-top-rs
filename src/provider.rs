@@ -12,8 +12,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Context as _;
-
 use crate::model::{short_id, ContainerLimits, ContainerSnapshot};
 
 /// Linha crua de stats (já com valores numéricos quando via Bollard).
@@ -187,41 +185,69 @@ impl CliProvider {
 
     async fn run_docker(&self, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
         let args = self.strip_local_context(args);
-        // No modo ssh os args docker vão DENTRO do comando remoto único
-        // (quotados); acrescentá-los de novo como argv do ssh os concatena ao
-        // comando e o shell remoto os trata como nomes de container.
-        let mut cmd = match &self.ssh_host {
-            Some(host) => {
-                let mut c = tokio::process::Command::new(&self.ssh_bin);
-                c.args(crate::transport::ssh_base_args(host, self.ssh_port));
-                c.arg(crate::transport::ssh_remote_command(args));
-                c
+        // ETXTBSY (issue #11): executar um script recém-escrito (binários fake
+        // dos testes) pode falhar com "Text file busy" sob carga — o fd de
+        // escrita/copy-up ainda é visível no exec. Retry curto resolve; sem
+        // ele o teste flakes em run paralelo. Outros erros de spawn não retry.
+        const ETXTBSY: i32 = 26;
+        const SPAWN_RETRIES: usize = 20;
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..SPAWN_RETRIES {
+            // No modo ssh os args docker vão DENTRO do comando remoto único
+            // (quotados); acrescentá-los de novo como argv do ssh os concatena ao
+            // comando e o shell remoto os trata como nomes de container.
+            let mut cmd = match &self.ssh_host {
+                Some(host) => {
+                    let mut c = tokio::process::Command::new(&self.ssh_bin);
+                    c.args(crate::transport::ssh_base_args(host, self.ssh_port));
+                    c.arg(crate::transport::ssh_remote_command(args));
+                    c
+                }
+                None => {
+                    let mut c = tokio::process::Command::new(&self.bin);
+                    c.args(args);
+                    c
+                }
+            };
+            // CRÍTICO: tokio output() só pipa stdout/stderr — sem isso o stdin
+            // herda o TTY e o ssh drena a fila de input, engolindo as teclas
+            // do usuário antes do crossterm ler (setas de ordenação "sumiam").
+            cmd.stdin(std::process::Stdio::null());
+            cmd.kill_on_drop(true);
+            let out = tokio::time::timeout(timeout, cmd.output()).await;
+            match out {
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "timeout {}s: {}",
+                        timeout.as_secs(),
+                        self.describe(args)
+                    ))
+                }
+                Ok(Err(e)) if e.raw_os_error() == Some(ETXTBSY) => {
+                    last_err = Some(
+                        anyhow::Error::new(e).context(format!("spawn {}", self.describe(args))),
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(Err(e)) => {
+                    return Err(
+                        anyhow::Error::new(e).context(format!("spawn {}", self.describe(args)))
+                    );
+                }
+                Ok(Ok(out)) => {
+                    if !out.status.success() {
+                        anyhow::bail!(
+                            "{} falhou: {}",
+                            self.describe(args),
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        );
+                    }
+                    return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+                }
             }
-            None => {
-                let mut c = tokio::process::Command::new(&self.bin);
-                c.args(args);
-                c
-            }
-        };
-        // CRÍTICO: tokio output() só pipa stdout/stderr — sem isso o stdin
-        // herda o TTY e o ssh drena a fila de input, engolindo as teclas
-        // do usuário antes do crossterm ler (setas de ordenação "sumiam").
-        cmd.stdin(std::process::Stdio::null());
-        cmd.kill_on_drop(true);
-        let out = tokio::time::timeout(timeout, cmd.output())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("timeout {}s: {}", timeout.as_secs(), self.describe(args))
-            })?
-            .with_context(|| format!("spawn {}", self.describe(args)))?;
-        if !out.status.success() {
-            anyhow::bail!(
-                "{} falhou: {}",
-                self.describe(args),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
         }
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("spawn {} esgotou retries", self.describe(args))))
     }
 }
 
@@ -966,7 +992,11 @@ mod tests {
 
     #[tokio::test]
     async fn cli_provider_ssh_direct_drops_local_context_and_runs_remote_docker() {
-        let dir = std::env::temp_dir().join(format!("dtsshprov-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dtsshprov-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_DOCKER_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("args.log");
@@ -1030,7 +1060,11 @@ mod tests {
 
     #[tokio::test]
     async fn cli_provider_system_info_uses_ttl_cache_within_same_tick() {
-        let dir = std::env::temp_dir().join(format!("dtsyscache-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dtsyscache-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_DOCKER_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("info.log");
@@ -1069,7 +1103,11 @@ mod tests {
     async fn bollard_lists_stats_and_inspects_over_unix_socket() {
         use tokio::net::UnixListener;
 
-        let dir = std::env::temp_dir().join(format!("dt-api-stats-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dt-api-stats-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_DOCKER_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("docker.sock");
@@ -1165,7 +1203,11 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
-        let dir = std::env::temp_dir().join(format!("dt-api-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dt-api-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_DOCKER_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("docker.sock");
@@ -1227,7 +1269,11 @@ mod tests {
     async fn bollard_system_info_defaults_missing_fields() {
         use tokio::net::UnixListener;
 
-        let dir = std::env::temp_dir().join(format!("dt-api-info-defaults-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dt-api-info-defaults-{}-{}",
+            std::process::id(),
+            NEXT_FAKE_DOCKER_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let socket = dir.join("docker.sock");
