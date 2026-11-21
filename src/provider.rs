@@ -183,14 +183,31 @@ impl CliProvider {
         }
     }
 
+    /// Erros de spawn transitórios do SO (issue #11): sob suite paralela o
+    /// fork/exec pode falhar com ETXTBSY (binário fake recém-escrito ainda
+    /// aberto p/ escrita no exec), EAGAIN/ENOMEM (pressão de processos/memória)
+    /// e EMFILE/ENFILE (fds) — todos somem em ms; retry resolve. Demais erros
+    /// (ENOENT, EACCES...) são falha real do binário: sem retry.
+    fn is_transient_spawn_error(err: &std::io::Error) -> bool {
+        use std::io::ErrorKind;
+        match err.kind() {
+            // EAGAIN/ENOMEM, mapeados pelo std; os valores crus divergem por SO.
+            ErrorKind::WouldBlock | ErrorKind::OutOfMemory => true,
+            _ => matches!(
+                err.raw_os_error(),
+                // ETXTBSY/ENFILE/EMFILE: 26/23/24 no Linux e macOS, sem
+                // ErrorKind estável no std.
+                Some(26 | 23 | 24)
+            ),
+        }
+    }
+
     async fn run_docker(&self, args: &[&str], timeout: Duration) -> anyhow::Result<String> {
         let args = self.strip_local_context(args);
-        // ETXTBSY (issue #11): executar um script recém-escrito (binários fake
-        // dos testes) pode falhar com "Text file busy" sob carga — o fd de
-        // escrita/copy-up ainda é visível no exec. Retry curto resolve; sem
-        // ele o teste flakes em run paralelo. Outros erros de spawn não retry.
-        const ETXTBSY: i32 = 26;
-        const SPAWN_RETRIES: usize = 20;
+        // Spawn transitório sob carga (issue #11): a classe de erros coberta
+        // por is_transient_spawn_error some em ms; 40×25ms ≈ 1s cobre o
+        // copy-up/exec de binário fake recém-escrito e picos de fork paralelo.
+        const SPAWN_RETRIES: usize = 40;
         let mut last_err: Option<anyhow::Error> = None;
         for _ in 0..SPAWN_RETRIES {
             // No modo ssh os args docker vão DENTRO do comando remoto único
@@ -223,7 +240,7 @@ impl CliProvider {
                         self.describe(args)
                     ))
                 }
-                Ok(Err(e)) if e.raw_os_error() == Some(ETXTBSY) => {
+                Ok(Err(e)) if Self::is_transient_spawn_error(&e) => {
                     last_err = Some(
                         anyhow::Error::new(e).context(format!("spawn {}", self.describe(args))),
                     );
@@ -810,6 +827,43 @@ mod tests {
             .expect("write HTTP response");
     }
 
+    /// Janela de retry da asserção (issue #11): falha de spawn transitória que
+    /// extrapole a janela de produção não pode derrubar o teste — re-tenta com
+    /// janela própria e, esgotada, panic com a causa raiz (nunca unwrap opaco).
+    async fn with_spawn_retry<T, F, Fut>(what: &str, mut op: F) -> T
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        const TEST_RETRIES: usize = 5;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..TEST_RETRIES {
+            match op().await {
+                Ok(value) => return value,
+                // Retry only transient spawn/IO failures (same class the
+                // production path retries); a logic bug must fail the test
+                // immediately instead of being masked by the window.
+                Err(err)
+                    if err.chain().any(|c| {
+                        c.downcast_ref::<std::io::Error>()
+                            .is_some_and(CliProvider::is_transient_spawn_error)
+                    }) || attempt + 1 == TEST_RETRIES =>
+                {
+                    last_err = Some(err);
+                    if attempt + 1 == TEST_RETRIES {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25 * (attempt as u64 + 1))).await;
+                }
+                Err(err) => panic!("{what}: falha não-transitória (bug real): {:#}", err),
+            }
+        }
+        panic!(
+            "{what}: janela de retry dos testes esgotou ({TEST_RETRIES} tentativas); último erro: {:#}",
+            last_err.expect("erro registrado")
+        );
+    }
+
     #[test]
     fn cache_evict_missing() {
         let mut c = Caches::default();
@@ -886,20 +940,87 @@ mod tests {
         .with_bin(bin);
         assert_eq!(p.context_name(), "default");
         assert_eq!(p.transport_label(), "cli");
-        let rows = p.list_stats().await.unwrap();
+        // Janela de retry da asserção (issue #11): transição de agendamento
+        // sob carga não pode virar falha de contrato.
+        let rows = with_spawn_retry("stats", || p.list_stats()).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "web");
-        let (cores, mem) = p.system_info().await.unwrap();
+        let (cores, mem) = with_spawn_retry("info", || p.system_info()).await;
         assert_eq!((cores, mem), (4, 8589934592));
-        let lim = p
-            .inspect_limits(&["abcdef123456".to_string()])
-            .await
-            .unwrap();
+        let ids = ["abcdef123456".to_string()];
+        let lim = with_spawn_retry("inspect", || p.inspect_limits(&ids)).await;
         assert_eq!(lim.len(), 1);
         assert!((lim[0].1.mem_limit - 536870912.0).abs() < 1.0);
-        let empty = p.inspect_limits(&[]).await.unwrap();
+        let empty = with_spawn_retry("inspect-empty", || p.inspect_limits(&[])).await;
         assert!(empty.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regressão determinística do retry de spawn (issue #11): segurar um fd
+    /// de escrita no binário fake garante ETXTBSY na 1ª tentativa de exec —
+    /// o closer libera o arquivo e o retry de produção precisa recuperar
+    /// sozinho (aqui NÃO há retry de teste). Se o loop de retry sumir num
+    /// refactor, este teste falha.
+    #[tokio::test]
+    async fn cli_provider_retries_spawn_until_fake_docker_is_writable() {
+        let script = "#!/bin/sh\nprintf 'abcdef123456\\tweb\\t5.0%%\\t100MiB / 1GiB\\t9.7%%\\t1MiB / 1MiB\\t1MiB / 1MiB\\t3\\n'\n";
+        let (bin, dir) = fake_docker_bin("etxtbsy", script);
+        let writer = std::fs::OpenOptions::new().write(true).open(&bin).unwrap();
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            drop(writer);
+        });
+        let p = CliProvider::new(
+            "default".into(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .with_bin(bin);
+        let rows = p
+            .list_stats()
+            .await
+            .expect("retry de spawn recupera ETXTBSY");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "web");
+        closer.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Contrato da classificação do retry de spawn: códigos/kinds transitórios
+    /// são retentáveis; falha real do binário (EPERM/ENOENT/EACCES) não.
+    #[test]
+    fn spawn_retry_covers_transient_os_errors_only() {
+        use std::io::Error;
+        use std::io::ErrorKind;
+
+        // ETXTBSY, ENFILE, EMFILE, EAGAIN, ENOMEM (errno difere por SO).
+        #[cfg(target_os = "macos")]
+        let transient_raw: &[i32] = &[26, 23, 24, 35, 12];
+        #[cfg(not(target_os = "macos"))]
+        let transient_raw: &[i32] = &[26, 23, 24, 11, 12];
+        for code in transient_raw {
+            assert!(
+                CliProvider::is_transient_spawn_error(&Error::from_raw_os_error(*code)),
+                "errno {code} deveria ser transitório"
+            );
+        }
+        assert!(CliProvider::is_transient_spawn_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(CliProvider::is_transient_spawn_error(&Error::from(
+            ErrorKind::OutOfMemory
+        )));
+        for code in [1, 2, 13] {
+            // EPERM, ENOENT, EACCES.
+            assert!(
+                !CliProvider::is_transient_spawn_error(&Error::from_raw_os_error(code)),
+                "errno {code} não deveria ser transitório"
+            );
+        }
+        assert!(!CliProvider::is_transient_spawn_error(&Error::from(
+            ErrorKind::NotFound
+        )));
     }
 
     #[tokio::test]
