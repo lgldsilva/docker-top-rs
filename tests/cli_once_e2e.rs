@@ -305,3 +305,243 @@ esac
     );
     let _ = fs::remove_dir_all(&home);
 }
+
+/// Endereço CSI `ESC[{row};{col}H` terminando em `h_pos` (varre de trás pra
+/// frente; dígitos coletados e revertidos na ordem certa).
+fn parse_csi_h(bytes: &[u8], h_pos: usize) -> Option<(usize, usize)> {
+    let mut k = h_pos;
+    let mut rows_digits: Vec<u8> = Vec::new();
+    let mut cols_digits: Vec<u8> = Vec::new();
+    let mut seen_semi = false;
+    while k > 0 {
+        k -= 1;
+        let c = bytes[k];
+        if c.is_ascii_digit() {
+            if seen_semi {
+                cols_digits.push(c);
+            } else {
+                rows_digits.push(c);
+            }
+        } else if c == b';' && !seen_semi {
+            seen_semi = true;
+        } else if c == b'[' && k > 0 && bytes[k - 1] == 0x1b {
+            if !seen_semi || rows_digits.is_empty() || cols_digits.is_empty() {
+                return None;
+            }
+            let fold = |d: &[u8]| {
+                d.iter()
+                    .rev()
+                    .fold(0usize, |a, c| a * 10 + (c - b'0') as usize)
+            };
+            return Some((fold(&rows_digits), fold(&cols_digits)));
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// Posições (linha, coluna) de cada emissão de seta de ordenação no stream
+/// ANSI: o endereço de cursor mais recente numa janela de 64 bytes antes de
+/// cada `▼`/`▲` (ratatui endereça célula a célula; a seta do frame completo
+/// vem embutida num run de células iniciado por um `ESC[R;CH`). O movimento
+/// da seta entre colunas é o rastro observável da hotkey no PTY.
+fn arrow_positions(stream: &str) -> Vec<(usize, usize)> {
+    let bytes = stream.as_bytes();
+    let mut out = Vec::new();
+    for (idx, ch) in stream.char_indices() {
+        if ch != '\u{25bc}' && ch != '\u{25b2}' {
+            continue;
+        }
+        let window_start = idx.saturating_sub(64);
+        let window = &bytes[window_start..idx];
+        let mut h = window.len();
+        while h > 0 {
+            h -= 1;
+            if window[h] == b'H' {
+                if let Some(pos) = parse_csi_h(window, h) {
+                    out.push(pos);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn stream_tail(stream: &str) -> String {
+    stream
+        .chars()
+        .rev()
+        .take(1500)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+/// Issue #12: o harness PTY via `script` herdava winsize 0×0 quando o stdout
+/// do próprio `script` não é TTY (CI/pipe) — ratatui não renderizava NADA
+/// (só escapes de cursor) e o efeito das hotkeys ficava invisível, parecendo
+/// "tecla não registrada". As teclas sempre chegaram ao app (o `q` sempre
+/// funcionou); a correlação com contexts ssh era espúria. Fix do harness:
+/// dimensionar o PTY com `stty` DENTRO da sessão, antes do `exec`.
+/// Este teste valida o path completo com um context ssh: tecla →
+/// handle_event → sort muda → seta migra de coluna no redraw endereçado.
+#[cfg(target_os = "linux")]
+#[test]
+fn tui_hotkeys_register_under_a_pseudo_terminal_with_ssh_context() {
+    let home = std::env::temp_dir().join(format!("docker-top-tui-hotkeys-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&home);
+    let docker_bin = home.join("bin");
+    let meta_dir = home.join(".docker/contexts/meta/default-hash");
+    fs::create_dir_all(&docker_bin).unwrap();
+    fs::create_dir_all(&meta_dir).unwrap();
+    let docker = docker_bin.join("docker");
+    fs::write(
+        &docker,
+        r##"#!/bin/sh
+if [ "$1" = "--version" ]; then exit 0; fi
+if [ "$1" = "context" ] && [ "$2" = "ls" ]; then printf 'default\n'; exit 0; fi
+if [ "$1" = "--context" ] && [ "$2" = "default" ]; then shift 2; fi
+case "$1" in
+  stats) printf 'abcdef123456\tweb\t5.0%%\t100MiB / 1GiB\t9.7%%\t1MiB / 2MiB\t3MiB / 4MiB\t3\n' ;;
+  info) printf '4\t8589934592\n' ;;
+  inspect) printf 'abcdef1234567890\t0\t0\t0\t\t536870912\n' ;;
+  *) echo "unexpected docker arguments: $*" >&2; exit 2 ;;
+esac
+"##,
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        meta_dir.join("meta.json"),
+        r#"{"Name":"default","Endpoints":{"docker":{"Host":"ssh://test-engine"}}}"#,
+    )
+    .unwrap();
+    let config = home.join("config.toml");
+    fs::write(&config, "").unwrap();
+    let binary = env!("CARGO_BIN_EXE_docker-top-rs");
+    let escaped = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    // winsize real dentro do PTY: sem isso o harness renderiza em 0×0 e
+    // nenhuma alteração de UI é observável (issue #12).
+    let shell_command = format!(
+        "stty rows 30 cols 140; exec {} --context default --config {}",
+        escaped(binary),
+        escaped(&config.to_string_lossy())
+    );
+    let mut command = Command::new("script");
+    command.args(["-qec", &shell_command, "/dev/null"]);
+    let profile = std::env::var_os("LLVM_PROFILE_FILE");
+    command
+        .current_dir(&home)
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", format!("{}:/usr/bin:/bin", docker_bin.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(profile) = profile {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let mut child = command.spawn().expect("start script with a PTY");
+    let mut input = child.stdin.take().expect("script stdin");
+    let stdout_pipe = child.stdout.take().expect("script stdout");
+    let stdout_buf = Arc::new(Mutex::new(String::new()));
+    let stdout_thread = drain_into(stdout_pipe, Arc::clone(&stdout_buf));
+    let mut wait_for = |needle: &str| -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if stdout_buf.lock().expect("lock PTY buffer").contains(needle) {
+                return true;
+            }
+            if child.try_wait().expect("poll PTY process").is_some() {
+                panic!("docker-top-rs saiu antes de {needle:?}");
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    // TUI de pé + coleta renderizada (prova que o PTY dimensionado desenha).
+    assert!(
+        wait_for("\u{1b}[?1049h"),
+        "TUI não entrou no alternate screen"
+    );
+    assert!(wait_for("web"), "rows não renderizaram no PTY dimensionado");
+    // Espera a seta inicial (sort padrão) ser emitida em alguma coluna.
+    let baseline = loop {
+        let positions = arrow_positions(&stdout_buf.lock().expect("lock PTY buffer"));
+        if !positions.is_empty() {
+            break positions;
+        }
+        if child.try_wait().expect("poll PTY process").is_some() {
+            panic!("seta de ordenação inicial nunca foi emitida");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    // Hotkey `i` (sort por id): a seta migra para uma coluna nunca vista.
+    input.write_all(b"i").expect("send sort-id key");
+    let mut seen = baseline.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let positions = arrow_positions(&stdout_buf.lock().expect("lock PTY buffer"));
+        if positions.len() > seen.len() && positions[seen.len()..].iter().any(|p| !seen.contains(p))
+        {
+            seen = positions;
+            break;
+        }
+        if child.try_wait().expect("poll PTY process").is_some() || Instant::now() >= deadline {
+            let stream = stdout_buf.lock().expect("lock PTY buffer").clone();
+            panic!(
+                "hotkey i não moveu a seta; tail do stream: {}",
+                stream_tail(&stream)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    // Hotkey `x` (sort por cpu_rel): a seta migra de novo (coluna distinta).
+    input.write_all(b"x").expect("send sort-cpu-rel key");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let positions = arrow_positions(&stdout_buf.lock().expect("lock PTY buffer"));
+        if positions.len() > seen.len() && positions[seen.len()..].iter().any(|p| !seen.contains(p))
+        {
+            break;
+        }
+        if child.try_wait().expect("poll PTY process").is_some() || Instant::now() >= deadline {
+            let stream = stdout_buf.lock().expect("lock PTY buffer").clone();
+            panic!(
+                "hotkey x não moveu a seta; tail do stream: {}",
+                stream_tail(&stream)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    input.write_all(b"q").expect("send quit key");
+    drop(input);
+    let quit_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("poll PTY process").is_some() {
+            break;
+        }
+        if Instant::now() >= quit_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("docker-top-rs TUI did not quit after q");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("collect PTY output");
+    stdout_thread.join().expect("join stdout drain");
+    let stdout = stdout_buf.lock().expect("lock PTY buffer").clone();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.contains("docker-top-rs finalizado."),
+        "stdout: {}",
+        stream_tail(&stdout)
+    );
+    let _ = fs::remove_dir_all(&home);
+}
