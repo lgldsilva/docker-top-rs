@@ -125,6 +125,23 @@ pub struct CliProvider {
     info_timeout: Duration,
 }
 
+/// Erro de timeout do `run_docker` com tipo próprio (issue #11): distingue
+/// "sem resposta a tempo" — classe ambiental (scheduler sob carga, ssh lento)
+/// — de falha de contrato/binário, sem casar string de mensagem.
+#[derive(Debug)]
+struct CommandTimeout {
+    secs: f64,
+    cmd: String,
+}
+
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "timeout {}s: {}", self.secs, self.cmd)
+    }
+}
+
+impl std::error::Error for CommandTimeout {}
+
 impl CliProvider {
     pub fn new(context: String, stats: Duration, inspect: Duration, info: Duration) -> Self {
         Self {
@@ -234,11 +251,12 @@ impl CliProvider {
             let out = tokio::time::timeout(timeout, cmd.output()).await;
             match out {
                 Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "timeout {}s: {}",
-                        timeout.as_secs(),
-                        self.describe(args)
-                    ))
+                    // Tipo próprio (issue #11): timeout é ambiental — o
+                    // consumidor classifica/re-tenta sem depender de mensagem.
+                    return Err(anyhow::Error::new(CommandTimeout {
+                        secs: timeout.as_secs_f64(),
+                        cmd: self.describe(args),
+                    }));
                 }
                 Ok(Err(e)) if Self::is_transient_spawn_error(&e) => {
                     last_err = Some(
@@ -827,9 +845,19 @@ mod tests {
             .expect("write HTTP response");
     }
 
-    /// Janela de retry da asserção (issue #11): falha de spawn transitória que
-    /// extrapole a janela de produção não pode derrubar o teste — re-tenta com
-    /// janela própria e, esgotada, panic com a causa raiz (nunca unwrap opaco).
+    /// Timeouts explícitos e generosos do teste (issue #11): o fake responde
+    /// em ms, mas sob suite paralela/CI carregado o atraso de spawn+pipeline
+    /// pode estourar janelas apertadas — 30s de margem não custa nada no
+    /// caminho feliz e elimina o flake por contenção de scheduler.
+    /// Determinismo do teste NÃO envolve alocação de rede: o fake não abre
+    /// porta/socket algum; o único recurso compartilhado é /tmp, isolado por
+    /// dir único (pid + contador atômico) — ver `fake_docker_bin`.
+    const TEST_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Janela de retry da asserção (issue #11): falha de spawn transitória OU
+    /// timeout que extrapole a janela de produção não pode derrubar o teste —
+    /// re-tenta com janela própria e, esgotada, panic com a causa raiz (nunca
+    /// unwrap opaco).
     async fn with_spawn_retry<T, F, Fut>(what: &str, mut op: F) -> T
     where
         F: FnMut() -> Fut,
@@ -840,13 +868,16 @@ mod tests {
         for attempt in 0..TEST_RETRIES {
             match op().await {
                 Ok(value) => return value,
-                // Retry only transient spawn/IO failures (same class the
-                // production path retries); a logic bug must fail the test
-                // immediately instead of being masked by the window.
+                // Retry only environmental classes (issue #11): transient
+                // spawn/IO errors (same class the production path retries)
+                // and command timeouts under parallel-load scheduling. A
+                // logic bug must fail the test immediately instead of being
+                // masked by the retry window.
                 Err(err)
                     if err.chain().any(|c| {
-                        c.downcast_ref::<std::io::Error>()
-                            .is_some_and(CliProvider::is_transient_spawn_error)
+                        c.downcast_ref::<CommandTimeout>().is_some()
+                            || c.downcast_ref::<std::io::Error>()
+                                .is_some_and(CliProvider::is_transient_spawn_error)
                     }) || attempt + 1 == TEST_RETRIES =>
                 {
                     last_err = Some(err);
@@ -933,9 +964,9 @@ mod tests {
         let (bin, dir) = fake_docker_bin("ok", script);
         let p = CliProvider::new(
             "default".into(),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
         assert_eq!(p.context_name(), "default");
@@ -972,9 +1003,9 @@ mod tests {
         });
         let p = CliProvider::new(
             "default".into(),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
         let rows = p
@@ -1023,15 +1054,41 @@ mod tests {
         )));
     }
 
+    /// Contrato do timeout tipado (issue #11): comando que não responde a
+    /// tempo falha com `CommandTimeout` no encadeamento do erro — é essa
+    /// classe (não a string da mensagem) que a janela de retry dos testes
+    /// classifica como ambiental e re-tenta sob carga.
+    #[tokio::test]
+    async fn cli_provider_timeout_is_typed_and_retry_classifiable() {
+        let (bin, dir) = fake_docker_bin("hang", "#!/bin/sh\nsleep 30\n");
+        let p = CliProvider::new(
+            "default".into(),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        )
+        .with_bin(bin);
+        let err = p
+            .list_stats()
+            .await
+            .expect_err("fake que dorme deve estourar timeout");
+        assert!(
+            err.chain()
+                .any(|c| c.downcast_ref::<CommandTimeout>().is_some()),
+            "timeout deveria carregar tipo próprio; cadeia: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn cli_provider_skips_blank_and_malformed_stats_rows() {
         let script = "#!/bin/sh\nprintf '%s' \"$*\" | grep -q 'stats' && printf '\\nmalformed row\\n\\033[31mabcdef123456\\tweb\\t5.0%%\\t100MiB / 1GiB\\t9.7%%\\t1MiB / 1MiB\\t1MiB / 1MiB\\t3\\033[0m\\n'\n";
         let (bin, dir) = fake_docker_bin("stats-filter", script);
         let provider = CliProvider::new(
             "default".into(),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
 
@@ -1047,9 +1104,9 @@ mod tests {
         let (bin, dir) = fake_docker_bin("fail", "#!/bin/sh\nexit 1\n");
         let p = CliProvider::new(
             "ctxdown".into(),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
         assert!(p.system_info().await.is_err());
@@ -1068,9 +1125,9 @@ mod tests {
         let (bin, dir) = fake_docker_bin("inspect-fallback-failures", script);
         let provider = CliProvider::new(
             "default".into(),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
 
@@ -1093,9 +1150,9 @@ mod tests {
         let (bin, dir) = fake_docker_bin("inspect-fallback", &script);
         let provider = CliProvider::new(
             "default".into(),
-            Duration::from_secs(3),
-            Duration::from_secs(3),
-            Duration::from_secs(3),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
 
@@ -1135,9 +1192,9 @@ mod tests {
         // bin local propositalmente inexistente: prova que o modo ssh não o usa.
         let p = CliProvider::new(
             "lab-node1".into(),
-            Duration::from_secs(3),
-            Duration::from_secs(3),
-            Duration::from_secs(3),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(PathBuf::from("/nonexistent-dt-docker"))
         .with_ssh_bin(bin)
@@ -1202,9 +1259,9 @@ mod tests {
         }
         let p = CliProvider::new(
             "default".into(),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         )
         .with_bin(bin);
 
@@ -1287,9 +1344,9 @@ mod tests {
         let provider = BollardProvider::new_full(
             "desktop-linux".into(),
             format!("unix://{}", socket.display()),
-            Duration::from_secs(3),
-            Duration::from_secs(3),
-            Duration::from_secs(3),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         );
         assert_eq!(provider.context_name(), "desktop-linux");
         assert_eq!(provider.transport_label(), "api");
@@ -1373,9 +1430,9 @@ mod tests {
         let provider = BollardProvider::new_full(
             "desktop-linux".into(),
             endpoint,
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
+            TEST_OP_TIMEOUT,
         );
         assert_eq!(provider.transport_label(), "api");
         assert_eq!(
