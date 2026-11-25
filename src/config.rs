@@ -406,8 +406,8 @@ mod tests {
 
     #[test]
     fn unknown_field_rejected() {
-        let dir = std::env::temp_dir().join(format!("dt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let p = dir.join("bad.toml");
         std::fs::write(&p, "refresh_delay = 2.0\ncampo_inexistente = 1\n").unwrap();
         let cli = test_cli();
@@ -416,8 +416,8 @@ mod tests {
 
     #[test]
     fn toml_file_overrides_default() {
-        let dir = std::env::temp_dir().join(format!("dt2-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let p = dir.join("ok.toml");
         std::fs::write(&p, "[thresholds]\nwarn = 60.0\ncrit = 90.0\n").unwrap();
         let cli = test_cli();
@@ -427,8 +427,8 @@ mod tests {
 
     #[test]
     fn example_roundtrip_loads_clean() {
-        let dir = std::env::temp_dir().join(format!("dtex-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let p = dir.join("config.example.toml");
         generate_example_file(&p).unwrap();
         let cli = test_cli();
@@ -439,8 +439,8 @@ mod tests {
 
     #[test]
     fn reload_applies_file_changes() {
-        let dir = std::env::temp_dir().join(format!("dtrel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let p = dir.join("c.toml");
         std::fs::write(&p, "refresh_delay = 2.0\n").unwrap();
         let cli = test_cli();
@@ -452,8 +452,8 @@ mod tests {
 
     #[test]
     fn invalid_sort_rejected() {
-        let dir = std::env::temp_dir().join(format!("dtbad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
         let p = dir.join("c.toml");
         std::fs::write(&p, "sort = \"nope\"\n").unwrap();
         let cli = test_cli();
