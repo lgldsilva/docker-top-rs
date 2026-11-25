@@ -613,6 +613,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml 1.2.0+spec-1.1.0",
 ]

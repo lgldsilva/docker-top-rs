@@ -35,5 +35,6 @@ dirs = "7"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
 insta = { version = "1", features = ["filters"] }
 tokio = { version = "1", features = ["full"] }

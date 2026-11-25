@@ -108,7 +108,8 @@ mod tests {
         l.log("nada deve acontecer");
         assert!(!l.enabled());
 
-        let p = std::env::temp_dir().join(format!("dtlog-{}.log", std::process::id()));
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("dtlog.log");
         let l = Logger::open(Some(&p));
         assert!(l.enabled());
         l.log("primeira linha");
@@ -126,19 +127,15 @@ mod tests {
             "linha 1: {}",
             lines[1]
         );
-        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn open_with_missing_parent_creates_it() {
-        let p = std::env::temp_dir()
-            .join(format!("dtlog-dir-{}", std::process::id()))
-            .join("sub")
-            .join("x.log");
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("sub").join("x.log");
         let l = Logger::open(Some(&p));
         assert!(l.enabled());
         l.log("ok");
         assert!(p.is_file());
-        let _ = std::fs::remove_file(&p);
     }
 }
